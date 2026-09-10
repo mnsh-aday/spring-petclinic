@@ -149,8 +149,11 @@ jobs:
           for d in $DIRS; do
             safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
             echo "::group::maven: $d (JDK ${{ steps.detect.outputs.java_version }})"
+            # Pinned to the version that produced 106/106 components WITH
+            # hashes on spring-petclinic (2026-09-10). Unpinned, a plugin
+            # release could change SBOM shape without any code change.
             mvn -B -f "$d/pom.xml" $SFLAG \
-              org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom \
+              org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
               -DoutputFormat=json -DoutputName=bom -DschemaVersion=1.6
             found=$(find "$d" -path '*/target/bom.json' | head -1)
             [ -n "$found" ] || { echo "::error::maven produced no bom.json in $d"; exit 1; }
@@ -233,7 +236,10 @@ jobs:
               echo '```'; echo "$UNSUP" | python -m json.tool; echo '```'
             fi
             echo
-            [ -f certin-compliance.md ] && cat certin-compliance.md
+            # `[ -f x ] && cat x` exits 1 when the file is absent, which made
+            # the negative-test run show TWO errors instead of one. An `if`
+            # has exit status 0 when its condition is simply false.
+            if [ -f certin-compliance.md ]; then cat certin-compliance.md; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SBOM
