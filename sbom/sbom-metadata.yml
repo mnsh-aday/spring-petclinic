@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# CERT-In SBOM: curated metadata
+#
+# The scanner can compute 18 of the 21 CERT-In section 4.2 data fields.
+# Three are HUMAN JUDGEMENT and must be owned by a person:
+#     criticality, usageRestrictions, comments
+#
+# This file is where those live. Everything here overrides the automatic
+# derivation, so it is also your escape hatch when a lookup gets something
+# wrong (an EOL date, a supplier name, an executable/archive flag).
+#
+# Commit this next to the code. Review it at the same cadence as a
+# dependency bump. Owner: <security-team / tech-lead name>
+# ---------------------------------------------------------------------------
+
+project:
+  # Used for metadata.supplier + "Author of SBOM Data" (CERT-In field 16),
+  # and to classify your own artefacts as origin=proprietary.
+  organization: "sbom-test"
+  sbomAuthor: "sbom-test (spring-petclinic fork)"
+
+  # CERT-In section 3.1 level and section 3.2 classification. Declared, not guessed.
+  # Levels:          Top-Level | n-Level | Delivery | Transitive | Complete
+  # Classifications: Design | Source | Build | Analyzed | Deployed | Runtime
+  sbomLevel: "Complete SBOM"
+  sbomClassification: "Build SBOM"
+
+defaults:
+  # Applied to any component with no explicit entry below.
+  usageRestrictions: "none"
+  eolDate: "not published by supplier"
+
+# ---------------------------------------------------------------------------
+# Per-component overrides.
+#
+# Match by (first hit wins, most specific first):
+#   purl:  exact PURL, with or without @version
+#   name:  component name
+#
+# Any of these keys may be set:
+#   criticality        critical | high | medium | low     (CERT-In field 12)
+#   usageRestrictions  free text                          (CERT-In field 13)
+#   comments           free text                          (CERT-In field 15)
+#   description        overrides generator description    (field 3)
+#   supplier           overrides derived supplier         (field 4)
+#   origin             proprietary | open-source | third-party vendor  (field 6)
+#   releaseDate        YYYY-MM-DD                         (field 10)
+#   eolDate            YYYY-MM-DD | free text             (field 11)
+#   patchStatus        free text (normally auto-computed)  (field 9)
+#   executable         yes | no                           (field 18)
+#   archive            yes | no                           (field 19)
+#   structured         yes | no                           (field 20)
+# ---------------------------------------------------------------------------
+
+components:
+  # --- Example: a component you rate business-critical -------------------
+  - purl: "pkg:maven/org.springframework.boot/spring-boot-starter-web"
+    criticality: "critical"
+    usageRestrictions: "none"
+    comments: "Primary HTTP entrypoint for the portal. Any CVE here is
+      internet-reachable; treat as P1 regardless of CVSS."
+
+  # --- Example: commercial component with real licence limits -----------
+  - purl: "pkg:maven/com.oracle.database.jdbc/ojdbc11"
+    criticality: "high"
+    origin: "third-party vendor"
+    usageRestrictions: "Oracle OTN licence - permitted only with a valid
+      Oracle Database licence. Redistribution to third parties prohibited."
+    comments: "Licence reviewed by Legal 2026-04-12. Do not ship to
+      customers outside the current Oracle agreement."
+
+  # --- Example: match by name, override a wrong auto-derived flag -------
+  - name: "tomcat-embed-core"
+    criticality: "critical"
+    executable: "yes"
+    comments: "Embedded servlet container. Auto-derivation marks embedded
+      jars as non-executable; overridden because it hosts the request loop."
+
+  # --- Example: SDK requiring an account, per CERT-In Table 6 pattern ----
+  - name: "twilio"
+    criticality: "medium"
+    usageRestrictions: "Requires an active Twilio account for API access."
+    comments: "Integrates SMS functionality via Twilio cloud
+      communications platform."

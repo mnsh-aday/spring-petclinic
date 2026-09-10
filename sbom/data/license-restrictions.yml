@@ -1,0 +1,301 @@
+# ---------------------------------------------------------------------------
+# SPDX licence identifier  ->  usage restrictions (CERT-In s4.2 field 13)
+#
+# WHY THIS FILE EXISTS, AND WHY IT DOES NOT NAME YOUR LIBRARIES
+#
+# This table is keyed on the LICENCE, not on the component. Your dependency
+# list is unbounded and unknown to whoever writes this file; the set of
+# licences in real-world use is small and closed - roughly 30 entries cover
+# well over 99% of everything on Maven Central and npm.
+#
+# The join happens at runtime:
+#     Syft says      tomcat-embed-core  ->  Apache-2.0
+#     this table says Apache-2.0        ->  "no restrictions on use..."
+#
+# So the mechanism is buildable without ever knowing your components exist.
+#
+# ANYTHING NOT LISTED HERE IS FLAGGED FOR LEGAL, NEVER GUESSED. That is the
+# whole point: because the author of this file cannot know your dependency
+# set, it must fail loudly on the unfamiliar rather than invent an answer.
+#
+# ---------------------------------------------------------------------------
+# STATUS: DRAFT - NOT YET LEGAL-REVIEWED
+#
+# These are engineering triage summaries, not legal advice. Route this file
+# through Legal ONCE; after sign-off it serves every repo and every build
+# with no further review. That is the advantage over generating this text per
+# component: one review of ~30 rows instead of hundreds of paragraphs.
+#
+# Reviewed by: ____________________  Date: __________
+# ---------------------------------------------------------------------------
+
+meta:
+  reviewed: false
+  reviewer: ""
+  reviewDate: ""
+  # Text applied when a licence is absent or unrecognised. Deliberately loud.
+  unknownRestriction: "UNRECOGNISED LICENCE - legal review required before distribution"
+
+licenses:
+
+  # ---------------- Permissive: safe to ship, attribution only ------------
+  MIT:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain copyright notice and licence text"
+  MIT-0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none"
+  Apache-2.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain notices and state modifications. Includes an
+      express patent grant, which terminates if you initiate patent litigation
+      over the work."
+  BSD-2-Clause:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain copyright notice and disclaimer"
+  BSD-3-Clause:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain notice. Must not use contributor names to
+      endorse or promote derived products without permission."
+  ISC:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain copyright notice"
+  0BSD:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none"
+  Unlicense:
+    category: public-domain
+    distributionRisk: low
+    restrictions: "none; public domain dedication"
+  CC0-1.0:
+    category: public-domain
+    distributionRisk: low
+    restrictions: "none; public domain dedication. Note: grants no trademark
+      or patent rights."
+  Zlib:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; do not misrepresent the origin of the software"
+  BSL-1.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; notice required for source distribution only"
+  PostgreSQL:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain copyright notice"
+  Python-2.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain notice and indicate modifications"
+  Apache-1.1:
+    category: permissive
+    distributionRisk: low
+    restrictions: "retain notice; attribution wording required in
+      documentation. Superseded by Apache-2.0 - prefer upgrading."
+
+  # ---------------- Weak copyleft: dynamic linking usually fine ----------
+  LGPL-2.1-only:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "Dynamic linking permitted for proprietary software.
+      Modifications to the library itself must be released under LGPL. Users
+      must be able to replace the library."
+  LGPL-2.1-or-later:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "Dynamic linking permitted for proprietary software.
+      Modifications to the library itself must be released under LGPL. Users
+      must be able to replace the library."
+  LGPL-3.0-only:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "As LGPL-2.1, plus anti-tivoisation terms. Static linking
+      triggers additional obligations - review before bundling."
+  LGPL-3.0-or-later:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "As LGPL-2.1, plus anti-tivoisation terms. Static linking
+      triggers additional obligations - review before bundling."
+  MPL-2.0:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "File-level copyleft. Modified MPL files must be released
+      under MPL; your own separate files are unaffected."
+  EPL-1.0:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "Modifications to EPL-covered code must be released under
+      EPL. Carries a patent-retaliation clause."
+  EPL-2.0:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "Modifications to EPL-covered code must be released under
+      EPL. May carry a secondary-licence GPL-compatibility option - check the
+      specific component."
+  CDDL-1.0:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "File-level copyleft, similar to MPL. Known to be
+      GPL-incompatible - do not combine with GPL code."
+  CDDL-1.1:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "File-level copyleft, similar to MPL. Known to be
+      GPL-incompatible - do not combine with GPL code."
+  IPL-1.0:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "IBM Public License. Modifications must be released under
+      IPL. Contains a patent-retaliation clause."
+
+  # ---------------- Strong copyleft: DANGEROUS for proprietary shipping --
+  GPL-2.0-only:
+    category: strong-copyleft
+    distributionRisk: high
+    restrictions: "DISTRIBUTION TRIGGER: shipping a derivative work obliges
+      you to release the complete corresponding source of the whole work
+      under GPL-2.0. Do not link into proprietary deliverables without
+      explicit legal approval."
+  GPL-2.0-or-later:
+    category: strong-copyleft
+    distributionRisk: high
+    restrictions: "DISTRIBUTION TRIGGER: shipping a derivative work obliges
+      you to release the complete corresponding source of the whole work
+      under GPL. Do not link into proprietary deliverables without explicit
+      legal approval."
+  GPL-3.0-only:
+    category: strong-copyleft
+    distributionRisk: high
+    restrictions: "DISTRIBUTION TRIGGER as GPL-2.0, plus explicit patent
+      grant and anti-tivoisation terms. Do not link into proprietary
+      deliverables without explicit legal approval."
+  GPL-3.0-or-later:
+    category: strong-copyleft
+    distributionRisk: high
+    restrictions: "DISTRIBUTION TRIGGER as GPL-2.0, plus explicit patent
+      grant and anti-tivoisation terms. Do not link into proprietary
+      deliverables without explicit legal approval."
+  GPL-2.0-with-classpath-exception:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "Classpath exception permits linking from independent
+      modules without triggering GPL on your code. Modifications to the
+      covered code itself remain GPL."
+
+  # ---------------- Network copyleft: SaaS trigger -----------------------
+  AGPL-3.0-only:
+    category: network-copyleft
+    distributionRisk: high
+    restrictions: "NETWORK TRIGGER: offering the functionality to users over
+      a network obliges you to offer them the complete corresponding source.
+      Applies to hosted and SaaS deployments even without distributing
+      binaries. Legal approval mandatory."
+  AGPL-3.0-or-later:
+    category: network-copyleft
+    distributionRisk: high
+    restrictions: "NETWORK TRIGGER: offering the functionality to users over
+      a network obliges you to offer them the complete corresponding source.
+      Applies to hosted and SaaS deployments even without distributing
+      binaries. Legal approval mandatory."
+
+  # ---------------- Source-available: NOT open source -------------------
+  SSPL-1.0:
+    category: source-available
+    distributionRisk: high
+    restrictions: "NOT an OSI-approved open-source licence. Offering the
+      software as a service obliges you to release the entire service stack.
+      Treat as commercially restricted."
+  BUSL-1.1:
+    category: source-available
+    distributionRisk: high
+    restrictions: "Business Source Licence: production use restricted until
+      the per-component change date, after which it converts to an
+      open-source licence. Verify the change date and additional-use grant
+      for this specific component and version."
+  Elastic-2.0:
+    category: source-available
+    distributionRisk: high
+    restrictions: "NOT open source. Prohibits providing the software as a
+      hosted or managed service to third parties."
+
+  # ---------------- Found in real scans, added after first pilot ---------
+  BlueOak-1.0.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; permissive with an explicit patent grant"
+  MIT-CMU:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain copyright notice (MIT variant used by Pillow)"
+  PSF-2.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain notice and indicate modifications"
+  ZPL-2.1:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; retain notice and disclaimer"
+  AFL-3.0:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none; includes patent and trademark provisions"
+  MPL-1.1:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "File-level copyleft. Superseded by MPL-2.0 - prefer upgrading."
+
+  # Content/data licences, not software licences. They appear in dependency
+  # trees anyway (browser-compat data, SPDX lists) and carry a real
+  # ATTRIBUTION duty that is easy to miss in a product.
+  CC-BY-3.0:
+    category: attribution-content
+    distributionRisk: medium
+    restrictions: "ATTRIBUTION REQUIRED: credit the author wherever the data
+      is used or redistributed. A data licence, not a software licence -
+      confirm the obligation is met in product documentation."
+  CC-BY-4.0:
+    category: attribution-content
+    distributionRisk: medium
+    restrictions: "ATTRIBUTION REQUIRED: credit the author and indicate
+      changes wherever the data is used or redistributed. A data licence,
+      not a software licence - confirm product documentation credits it."
+
+  # Ambiguous PyPI trove classifiers. The classifier does not name the
+  # variant, so guessing an exact SPDX id would be a fabrication. These
+  # record the risk correctly and say what is unresolved.
+  LicenseRef-PyPI-BSD-unspecified:
+    category: permissive
+    distributionRisk: low
+    restrictions: "none expected; retain copyright notice. NOTE: the PyPI
+      classifier says only \"BSD License\" and does not state whether it is
+      2-clause or 3-clause. Both are permissive, so the risk is low, but
+      confirm the variant from the package's own LICENSE file if the
+      no-endorsement clause matters to you."
+  LicenseRef-PyPI-LGPL-unspecified:
+    category: weak-copyleft
+    distributionRisk: medium
+    restrictions: "COPYLEFT - REVIEW REQUIRED: the PyPI classifier says only
+      \"LGPL\" without a version. Dynamic linking is normally permitted for
+      proprietary software, but obligations differ between LGPL-2.1 and
+      LGPL-3.0. Determine the version from the package before shipping."
+
+  # ---------------- Commercial / vendor ---------------------------------
+  LicenseRef-Oracle-OTN:
+    category: commercial
+    distributionRisk: high
+    restrictions: "Oracle Technology Network licence: permitted only with a
+      valid corresponding Oracle product licence. Redistribution to third
+      parties prohibited."
+  LicenseRef-Proprietary:
+    category: commercial
+    distributionRisk: high
+    restrictions: "Proprietary licence - terms governed by the specific
+      vendor agreement. Confirm scope before distribution."

@@ -1,0 +1,250 @@
+# ---------------------------------------------------------------------------
+# UNIVERSAL SBOM WORKFLOW - one file for every repository.
+#
+# Nothing about the repository is hardcoded here. detect_ecosystems.py walks
+# the checkout, finds every package manifest (in any subdirectory), and this
+# workflow runs whichever generators apply, then merges the results.
+#
+#   package-lock.json  found -> cyclonedx-npm             (per directory)
+#   requirements.txt   found -> cyclonedx-py              (per directory)
+#   pom.xml            found -> cyclonedx-maven-plugin    (per directory,
+#                                JDK version read from the pom itself)
+#
+# A repo with Java AND Python runs both generators. A repo with only npm
+# runs one. Same file, different steps fire.
+#
+# Three guarantees, each the fix for a real failure seen on this project:
+#   - nothing detected      -> the run FAILS (no empty "clean" SBOM)
+#   - detected but no BOM   -> the run FAILS and names the ecosystem
+#   - detected, unsupported -> named in the summary as a gap, never silent
+#
+# Deploy: copy to .github/workflows/sbom.yml alongside the sbom/ folder.
+# Or publish once and have each repo call it with `uses:` (see README).
+# ---------------------------------------------------------------------------
+name: SBOM
+
+on:
+  workflow_dispatch:
+    inputs:
+      offline:
+        description: "Skip registry lookups and OSV scan (company repos, until data egress is approved)"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      offline:
+        type: boolean
+        default: false
+      fail-on-missing:
+        description: "CERT-In field keys required on every component"
+        type: string
+        default: ""
+      min-coverage:
+        type: number
+        default: 0
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  sbom:
+    name: Detect, generate, merge, enrich
+    runs-on: ubuntu-latest
+    env:
+      SBOM_TOOLS: sbom/scripts
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python is needed regardless of the repo's language: the detector,
+      # merger and enricher are Python scripts.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install SBOM tooling
+        run: pip install --quiet pyyaml cyclonedx-bom
+
+      # -------------------------------------------------------------------
+      # DETECT - the only step that looks at the repo's shape.
+      # Fails the run if no supported manifest exists anywhere.
+      # -------------------------------------------------------------------
+      - name: Detect ecosystems
+        id: detect
+        run: |
+          python "$SBOM_TOOLS/detect_ecosystems.py" . --github-output "$GITHUB_OUTPUT"
+          mkdir -p boms
+
+      # -------------------------------------------------------------------
+      # PYTHON - one venv per requirements.txt, scanned in environment mode
+      # (requirements mode gives 0% licences; environment mode gives 100%).
+      # -------------------------------------------------------------------
+      - name: Python SBOMs
+        if: steps.detect.outputs.has_python == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.python_dirs }}
+        run: |
+          set -euo pipefail
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::python: $d"
+            python -m venv ".venv-$safe"
+            ".venv-$safe/bin/pip" install --quiet --upgrade pip
+            ".venv-$safe/bin/pip" install --quiet -r "$d/requirements.txt"
+            ".venv-$safe/bin/pip" install --quiet cyclonedx-bom
+            ".venv-$safe/bin/cyclonedx-py" environment ".venv-$safe" \
+              --of json --sv 1.6 -o "boms/python-$safe.json"
+            echo "wrote boms/python-$safe.json"
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
+      # NPM - lockfile-only, so no `npm ci` and no failure on stale trees.
+      # -------------------------------------------------------------------
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.has_npm == '1'
+        with:
+          node-version: '20'
+
+      - name: npm SBOMs
+        if: steps.detect.outputs.has_npm == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.npm_dirs }}
+        run: |
+          set -euo pipefail
+          ROOT=$(pwd)
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::npm: $d"
+            ( cd "$d" && npx --yes @cyclonedx/cyclonedx-npm@latest \
+                --package-lock-only --output-format json --spec-version 1.6 \
+                --output-file "$ROOT/boms/npm-$safe.json" )
+            echo "wrote boms/npm-$safe.json"
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
+      # MAVEN - asks Maven for the RESOLVED tree, which is what GitHub's own
+      # export cannot do (it left 60% of colendingservice without versions).
+      # JDK version comes from the pom; settings file from wherever the
+      # repo's own CI keeps it.
+      # -------------------------------------------------------------------
+      - uses: actions/setup-java@v4
+        if: steps.detect.outputs.has_maven == '1'
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+          cache: maven
+
+      - name: Maven SBOMs
+        if: steps.detect.outputs.has_maven == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.maven_dirs }}
+          SETTINGS: ${{ steps.detect.outputs.maven_settings }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SFLAG=""
+          if [ -n "$SETTINGS" ]; then SFLAG="-s $SETTINGS"; echo "using settings: $SETTINGS"; fi
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::maven: $d (JDK ${{ steps.detect.outputs.java_version }})"
+            mvn -B -f "$d/pom.xml" $SFLAG \
+              org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom \
+              -DoutputFormat=json -DoutputName=bom -DschemaVersion=1.6
+            found=$(find "$d" -path '*/target/bom.json' | head -1)
+            [ -n "$found" ] || { echo "::error::maven produced no bom.json in $d"; exit 1; }
+            cp "$found" "boms/maven-$safe.json"
+            echo "wrote boms/maven-$safe.json"
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
+      # GUARD - every detected ecosystem must have produced a BOM.
+      # Silent partial success is the failure mode this whole project keeps
+      # running into; refuse it explicitly.
+      # -------------------------------------------------------------------
+      - name: Verify every detected ecosystem produced output
+        env:
+          HAS_PY: ${{ steps.detect.outputs.has_python }}
+          HAS_NPM: ${{ steps.detect.outputs.has_npm }}
+          HAS_MVN: ${{ steps.detect.outputs.has_maven }}
+        run: |
+          fail=0
+          chk() { if [ "$1" = "1" ] && ! ls boms/$2-*.json >/dev/null 2>&1; then
+                    echo "::error::$2 was detected but produced no SBOM"; fail=1; fi; }
+          chk "$HAS_PY" python; chk "$HAS_NPM" npm; chk "$HAS_MVN" maven
+          echo "BOMs produced:"; ls -1 boms/
+          exit $fail
+
+      # -------------------------------------------------------------------
+      # MERGE - one SBOM per delivered product, as CERT-In expects.
+      # -------------------------------------------------------------------
+      - name: Merge
+        run: |
+          python "$SBOM_TOOLS/merge_boms.py" -o bom.json \
+            --name "${{ github.event.repository.name }}" \
+            --version "${{ github.sha }}" \
+            boms/*.json
+
+      # -------------------------------------------------------------------
+      # ENRICH + SCAN - fills the 21 CERT-In fields, including 8 and 9 from
+      # a live OSV scan. Every npm lockfile found feeds --npm-lock so field 14
+      # (checksums) is populated for the npm half.
+      # -------------------------------------------------------------------
+      - name: Enrich to CERT-In and scan
+        env:
+          NPM_DIRS: ${{ steps.detect.outputs.npm_dirs }}
+          OFFLINE: ${{ inputs.offline }}
+          REQ: ${{ inputs.fail-on-missing }}
+          MINCOV: ${{ inputs.min-coverage }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          for d in $NPM_DIRS; do ARGS+=(--npm-lock "$d/package-lock.json"); done
+          if [ "$OFFLINE" = "true" ]; then ARGS+=(--offline); else ARGS+=(--scan-osv); fi
+          [ -n "$REQ" ] && ARGS+=(--fail-on-missing "$REQ")
+          [ -n "$MINCOV" ] && [ "$MINCOV" != "0" ] && ARGS+=(--min-coverage "$MINCOV")
+          python "$SBOM_TOOLS/certin_enrich.py" \
+            --input bom.json --output bom.certin.json \
+            --metadata sbom/sbom-metadata.yml \
+            --report certin-compliance.md \
+            "${ARGS[@]}"
+
+      # -------------------------------------------------------------------
+      # SUMMARY - the report, plus any ecosystem we saw but cannot yet
+      # generate for. Those are gaps and must be visible.
+      # -------------------------------------------------------------------
+      - name: Publish summary
+        if: always()
+        env:
+          UNSUP: ${{ steps.detect.outputs.unsupported_json }}
+        run: |
+          {
+            echo "## Detected"
+            echo '```'
+            echo "python : ${{ steps.detect.outputs.python_dirs || '-' }}"
+            echo "npm    : ${{ steps.detect.outputs.npm_dirs || '-' }}"
+            echo "maven  : ${{ steps.detect.outputs.maven_dirs || '-' }}  (JDK ${{ steps.detect.outputs.java_version }})"
+            echo '```'
+            if [ -n "$UNSUP" ] && [ "$UNSUP" != "{}" ]; then
+              echo "## :warning: Detected but NOT yet supported"
+              echo "These ecosystems exist in this repo and are **absent from the SBOM**:"
+              echo '```'; echo "$UNSUP" | python -m json.tool; echo '```'
+            fi
+            echo
+            [ -f certin-compliance.md ] && cat certin-compliance.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-certin
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            bom.certin.json
+            bom.json
+            certin-compliance.md
+            boms/
