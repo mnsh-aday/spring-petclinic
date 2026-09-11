@@ -89,8 +89,10 @@ def main() -> int:
     }
 
     seen_keys: dict = {}
-    root_children: list = []
+    root_children: list = []     # ONLY true direct deps + orphans, never everything
     dep_entries: list = []
+    all_refs: list = []          # every kept component's ref
+    reached: set = set()         # every ref some dependency entry points at
     dropped = 0
 
     for path, bom in boms:
@@ -109,23 +111,40 @@ def main() -> int:
             merged["components"].append(c)
             ref = c.get("bom-ref") or c.get("purl")
             if ref:
-                root_children.append(ref)
+                all_refs.append(ref)
+            # NOTE: deliberately NOT appended to root_children here. An earlier
+            # version did, which made every component a direct dependency of
+            # the merged root and destroyed the direct/transitive distinction
+            # the criticality policy depends on (measured: 27 direct became 652).
 
-        # keep each input's graph, but re-point its old root at the new one
+        # Keep each input's graph. The input's own root is replaced by the new
+        # merged root, so its direct dependencies become the merged root's.
         for d in (bom.get("dependencies") or []):
             ref = d.get("ref")
+            targets = d.get("dependsOn") or []
             if ref and sub_root and ref == sub_root:
-                root_children.extend(d.get("dependsOn") or [])
+                root_children.extend(targets)
+                reached.update(targets)
                 continue
             dep_entries.append(d)
+            reached.update(targets)
 
         for v in (bom.get("vulnerabilities") or []):
             merged["vulnerabilities"].append(v)
 
-    # de-duplicate the direct children of the new root
+    # Orphans: components no edge points at. Happens when a generator emits no
+    # graph at all (then ALL its components are orphans, which correctly makes
+    # them direct - the same conservative fallback the enricher uses). Attach
+    # them to the root so the graph stays connected, but ONLY them.
+    orphans = [r for r in all_refs if r not in reached and r not in root_children]
+    root_children.extend(orphans)
+
     merged["dependencies"].append(
         {"ref": root_ref, "dependsOn": list(dict.fromkeys(root_children))})
     merged["dependencies"].extend(dep_entries)
+    direct_n = len(dict.fromkeys(root_children))
+    print("[merge] direct deps : " + str(direct_n) + " of " + str(len(all_refs))
+          + " components (" + str(len(orphans)) + " orphans attached to root)")
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, ensure_ascii=False)

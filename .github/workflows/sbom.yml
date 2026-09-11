@@ -198,6 +198,7 @@ jobs:
       - name: Enrich to CERT-In and scan
         env:
           NPM_DIRS: ${{ steps.detect.outputs.npm_dirs }}
+          PY_DIRECT: ${{ steps.detect.outputs.python_direct_files }}
           OFFLINE: ${{ inputs.offline }}
           REQ: ${{ inputs.fail-on-missing }}
           MINCOV: ${{ inputs.min-coverage }}
@@ -205,6 +206,7 @@ jobs:
           set -euo pipefail
           ARGS=()
           for d in $NPM_DIRS; do ARGS+=(--npm-lock "$d/package-lock.json"); done
+          for f in $PY_DIRECT; do ARGS+=(--direct-deps "$f"); done
           if [ "$OFFLINE" = "true" ]; then ARGS+=(--offline); else ARGS+=(--scan-osv); fi
           [ -n "$REQ" ] && ARGS+=(--fail-on-missing "$REQ")
           [ -n "$MINCOV" ] && [ "$MINCOV" != "0" ] && ARGS+=(--min-coverage "$MINCOV")

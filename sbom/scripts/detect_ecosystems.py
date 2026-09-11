@@ -137,6 +137,19 @@ def detect(root: str) -> dict:
     for k in found:
         found[k] = list(dict.fromkeys(found[k]))
 
+    # Files naming a Python project's DIRECT dependencies. requirements.txt is
+    # frequently pip-freeze output - every package, transitives included - so
+    # it cannot say what the developer asked for. requirements.in (pip-tools)
+    # or pyproject.toml can. The enricher uses these to correct the direct
+    # set; without them, 'direct' is approximated and Django-class packages
+    # get misread as transitive because other packages depend on them.
+    python_direct_files = []
+    for d in found["python"]:
+        base = root if d == "." else os.path.join(root, d)
+        for cand in ("requirements.in", "pyproject.toml"):
+            if os.path.isfile(os.path.join(base, cand)):
+                python_direct_files.append((d + "/" if d != "." else "") + cand)
+
     java_version = None
     for d in found["maven"]:
         v = java_version_from_pom(os.path.join(root, d, "pom.xml"))
@@ -152,6 +165,7 @@ def detect(root: str) -> dict:
         "java_version": java_version or "17",
         "java_version_source": "pom.xml" if java_version else "default",
         "maven_settings": find_maven_settings(root) if found["maven"] else None,
+        "python_direct_files": python_direct_files,
         "unsupported": unsupported,
         "any_supported": any(found.values()),
     }
@@ -175,6 +189,7 @@ def main() -> int:
             f.write("has_maven=" + ("1" if r["maven"] else "0") + "\n")
             f.write("npm_dirs=" + " ".join(r["npm"]) + "\n")
             f.write("python_dirs=" + " ".join(r["python"]) + "\n")
+            f.write("python_direct_files=" + " ".join(r["python_direct_files"]) + "\n")
             f.write("maven_dirs=" + " ".join(r["maven"]) + "\n")
             f.write("java_version=" + r["java_version"] + "\n")
             f.write("maven_settings=" + (r["maven_settings"] or "") + "\n")

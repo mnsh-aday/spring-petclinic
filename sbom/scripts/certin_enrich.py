@@ -714,6 +714,56 @@ def load_vulns(path: Any) -> tuple:
     return index, cdx_vulns
 
 
+def norm_pyname(n: Any) -> str:
+    """PEP 503 normalisation: Django, python_dotenv, Pillow -> django, python-dotenv, pillow."""
+    return re.sub(r"[-_.]+", "-", str(n or "")).lower()
+
+
+def load_declared_direct(paths: list) -> set:
+    """Package names a project DECLARES as its direct dependencies.
+
+    Why this exists: cyclonedx-py's environment mode scans an installed venv,
+    and a venv has no notion of a root project - it cannot tell what the
+    developer asked for from what came along. Inferring 'direct' as 'nothing
+    depends on it' misread 15 of 26 declared packages on a real repo,
+    including Django, cryptography and bcrypt, because central packages are
+    exactly the ones other packages depend on.
+
+    Sources, one requirement per line or PEP 621:
+      requirements.in           (pip-tools style; requirements.txt is usually
+                                 pip-freeze output listing EVERYTHING, so it
+                                 cannot serve here)
+      pyproject.toml            [project].dependencies (needs Python 3.11+)
+    Returns normalised names. Environment markers, extras and version pins
+    are stripped; `-r`/`-e` lines are skipped.
+    """
+    names: set = set()
+    for p in paths:
+        if not os.path.exists(p):
+            log("WARNING direct-deps file not found: " + str(p))
+            continue
+        reqs: list = []
+        if str(p).endswith(".toml"):
+            try:
+                import tomllib
+                with open(p, "rb") as f:
+                    data = tomllib.load(f)
+                reqs = list((data.get("project") or {}).get("dependencies") or [])
+            except Exception as e:
+                log("WARNING could not read " + str(p) + ": " + str(e))
+        else:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                reqs = [line for line in f]
+        for line in reqs:
+            s = str(line).split("#", 1)[0].strip()
+            if not s or s.startswith("-"):
+                continue
+            name = re.split(r"[<>=!~\[;@\s]", s, 1)[0].strip()
+            if name:
+                names.add(norm_pyname(name))
+    return names
+
+
 def scan_osv(components: list) -> tuple:
     """Query OSV.dev for every component and return CycloneDX vulnerabilities.
 
@@ -895,6 +945,10 @@ def main() -> int:
                     metavar="package-lock.json",
                     help="npm lockfile to pull integrity hashes from for "
                          "CERT-In field 14; repeatable for monorepos")
+    ap.add_argument("--direct-deps", action="append", default=[], metavar="FILE",
+                    help="requirements.in or pyproject.toml naming a project's DIRECT "
+                         "dependencies; overrides the graph-derived direct set. Needed "
+                         "for Python, whose venv scan cannot tell asked-for from came-along")
     ap.add_argument("--vulns", help="OWASP Dependency-Check JSON or CycloneDX VDR")
     ap.add_argument("--scan-osv", action="store_true",
                     help="query OSV.dev directly to fill CERT-In fields 8 and 9; "
@@ -985,6 +1039,29 @@ def main() -> int:
         # no usable graph -> treat all as direct so criticality stays meaningful
         for c in components:
             direct.update(comp_keys(c))
+
+    # Declared direct dependencies (requirements.in / pyproject.toml) override
+    # whatever the graph implied. Also written back into the root's dependsOn
+    # so the SBOM's own graph (field 7) is correct, not just our criticality.
+    declared = load_declared_direct(args.direct_deps) if args.direct_deps else set()
+    if declared:
+        root_dep = next((d for d in (bom.get("dependencies") or [])
+                         if root_ref and d.get("ref") == root_ref), None)
+        promoted = 0
+        for c in components:
+            if norm_pyname(c.get("name")) not in declared:
+                continue
+            keys = comp_keys(c)
+            if not any(k in direct for k in keys):
+                direct.update(keys)
+                promoted += 1
+                ref = c.get("bom-ref") or c.get("purl")
+                if root_dep is not None and ref:
+                    lst = root_dep.setdefault("dependsOn", [])
+                    if ref not in lst:
+                        lst.append(ref)
+        log("declared direct deps: " + str(len(declared)) + " names -> "
+            + str(promoted) + " components promoted from transitive to direct")
 
     if args.scan_osv:
         if args.offline:
