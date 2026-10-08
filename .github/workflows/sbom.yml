@@ -53,6 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SBOM_TOOLS: sbom/scripts
+      # Promoted to job level so a step-level `if:` can test them - the
+      # `secrets` context is not available inside step conditionals.
+      INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
+      INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -256,3 +260,54 @@ jobs:
             bom.json
             certin-compliance.md
             boms/
+
+      # -------------------------------------------------------------------
+      # PUBLISH TO THE CENTRAL INVENTORY
+      #
+      # Build artifacts expire (90 days), so they cannot be what the nightly
+      # sweep re-checks. One SBOM per repository is committed to an inventory
+      # repository instead, overwritten on each push - the current truth for
+      # this project, kept for as long as the repository exists.
+      #
+      # Skipped entirely when the two secrets are absent, so this workflow
+      # still works standalone in a repo that is not wired to an inventory.
+      #
+      # SETUP (once, by whoever deploys):
+      #   SBOM_INVENTORY_REPO   e.g. my-org/sbom-inventory
+      #   SBOM_INVENTORY_TOKEN  fine-grained PAT, Contents: read+write,
+      #                         scoped to ONLY that inventory repo
+      # Set them as organisation secrets so every repo inherits them.
+      # -------------------------------------------------------------------
+      - name: Publish SBOM to the inventory
+        if: env.INVENTORY_REPO != '' && env.INVENTORY_TOKEN != '' && success()
+        run: |
+          set -euo pipefail
+          SLUG=$(echo "${{ github.repository }}" | tr '/' '_')
+          git clone --quiet --depth 1 \
+            "https://x-access-token:${INVENTORY_TOKEN}@github.com/${INVENTORY_REPO}.git" \
+            _inventory
+          mkdir -p "_inventory/sboms"
+          cp bom.certin.json "_inventory/sboms/${SLUG}.cdx.json"
+          cd _inventory
+          if git diff --quiet -- "sboms/${SLUG}.cdx.json"; then
+            echo "SBOM unchanged for ${{ github.repository }} - nothing to publish"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "sboms/${SLUG}.cdx.json"
+          git commit -m "SBOM: ${{ github.repository }} @ ${{ github.sha }}"
+          # Another repo may publish at the same moment; rebase and retry.
+          for i in 1 2 3; do
+            if git push; then echo "published"; exit 0; fi
+            echo "push rejected (attempt $i) - rebasing"
+            git pull --rebase --quiet || true
+            sleep $((i * 3))
+          done
+          echo "::error::could not publish SBOM to ${INVENTORY_REPO} after 3 attempts"
+          exit 1
+
+      - name: Note when publishing is not configured
+        if: env.INVENTORY_REPO == ''
+        run: |
+          echo "> SBOM not published to a central inventory - \`SBOM_INVENTORY_REPO\` is not set. The nightly sweep will not see this project." >> "$GITHUB_STEP_SUMMARY"

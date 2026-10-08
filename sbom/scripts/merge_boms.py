@@ -28,7 +28,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from datetime import datetime, timezone
+from typing import Any
+
+TOOL_VERSION = "1.1.0"
+
 
 
 def comp_key(c: dict) -> str:
@@ -37,6 +42,44 @@ def comp_key(c: dict) -> str:
     if purl:
         return purl.split("?")[0]
     return str(c.get("name")) + "@" + str(c.get("version"))
+
+
+def flatten(components: Any) -> list:
+    """Return every component, including ones nested inside others.
+
+    A nested component is still a component that ships in the product. Leaving
+    it nested hides it from de-duplication, enrichment and the compliance
+    count, so it is lifted to the top level here. Its own `components` key is
+    removed once its children have been lifted, and an edge is recorded on the
+    parent so the relationship survives in the dependency graph.
+    """
+    out: list = []
+
+    def walk(lst, parent_ref=None):
+        for c in (lst or []):
+            if not isinstance(c, dict):
+                continue
+            children = c.pop("components", None)
+            out.append(c)
+            ref = c.get("bom-ref") or c.get("purl")
+            if children:
+                kids = []
+                for k in children:
+                    if isinstance(k, dict):
+                        kr = k.get("bom-ref") or k.get("purl")
+                        if kr:
+                            kids.append(kr)
+                if kids and ref:
+                    NESTED_EDGES.append({"ref": ref, "dependsOn": kids})
+                walk(children, ref)
+
+    walk(components)
+    return out
+
+
+# Edges recovered from nesting, folded into the merged graph so the
+# parent/child relationship is not lost when components are flattened.
+NESTED_EDGES: list = []
 
 
 def load(path: str) -> dict:
@@ -68,20 +111,49 @@ def main() -> int:
         seen = [b.get("specVersion", "1.5") for _p, b in boms]
         spec = max(seen, key=lambda s: [int(x) for x in s.split(".")])
 
+    # Carry forward every generator that contributed. An earlier version
+    # replaced the whole tools list with "merge_boms.py", erasing which tool
+    # actually produced each half of the SBOM - provenance a reader needs, and
+    # which quality scorers check for.
+    tools: list = []
+    seen_tools: set = set()
+    for _p, b in boms:
+        t = (b.get("metadata") or {}).get("tools")
+        entries = t.get("components", []) if isinstance(t, dict) else (t or [])
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            key = (e.get("name"), e.get("version"))
+            if e.get("name") and key not in seen_tools:
+                seen_tools.add(key)
+                tools.append({k: v for k, v in e.items()
+                              if k in ("vendor", "name", "version", "type")})
+    tools.append({"name": "merge_boms.py", "version": TOOL_VERSION,
+                  "type": "application"})
+
     root_ref = "root-" + args.name
     merged: dict = {
         "bomFormat": "CycloneDX",
         "specVersion": spec,
+        # A document identity of its own. Required by CycloneDX and used to
+        # tell two SBOMs of the same product apart.
+        "serialNumber": "urn:uuid:" + str(uuid.uuid4()),
         "version": 1,
         "metadata": {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # CycloneDX's native field for WHEN in the lifecycle this was taken.
+            # CERT-In s3.2 calls the same thing an SBOM "classification".
+            "lifecycles": [{"phase": "build"}],
             "component": {
                 "bom-ref": root_ref,
                 "type": "application",
                 "name": args.name,
                 "version": args.version,
             },
-            "tools": [{"name": "merge_boms.py"}],
+            "tools": {"components": tools},
+            # Licence of the SBOM DOCUMENT itself, not of its contents.
+            # CC0 is the convention, matching SPDX's dataLicense.
+            "licenses": [{"license": {"id": "CC0-1.0"}}],
         },
         "components": [],
         "dependencies": [],
@@ -99,7 +171,15 @@ def main() -> int:
         label = path.replace("\\", "/").split("/")[-1]
         sub_root = ((bom.get("metadata") or {}).get("component") or {}).get("bom-ref")
 
-        for c in (bom.get("components") or []):
+        # FLATTEN nested components. CycloneDX permits components to contain
+        # sub-components, and cyclonedx-npm uses that heavily. Anything left
+        # nested is invisible to every later stage: it is never de-duplicated,
+        # never enriched, and never counted in the compliance report. Measured
+        # on one real SBOM: 114 of 766 components sat nested and received none
+        # of the 21 CERT-In fields, while the report claimed full coverage of
+        # "652 components". Relationships are preserved in `dependencies`,
+        # which is where CycloneDX expects them, so flattening loses nothing.
+        for c in flatten(bom.get("components")):
             k = comp_key(c)
             if k in seen_keys:
                 dropped += 1
@@ -132,6 +212,12 @@ def main() -> int:
         for v in (bom.get("vulnerabilities") or []):
             merged["vulnerabilities"].append(v)
 
+    # Edges recovered from flattening, so a parent/child relationship that was
+    # expressed by nesting survives as a real graph edge.
+    dep_entries.extend(NESTED_EDGES)
+    for e in NESTED_EDGES:
+        reached.update(e.get("dependsOn") or [])
+
     # Orphans: components no edge points at. Happens when a generator emits no
     # graph at all (then ALL its components are orphans, which correctly makes
     # them direct - the same conservative fallback the enricher uses). Attach
@@ -139,9 +225,31 @@ def main() -> int:
     orphans = [r for r in all_refs if r not in reached and r not in root_children]
     root_children.extend(orphans)
 
-    merged["dependencies"].append(
-        {"ref": root_ref, "dependsOn": list(dict.fromkeys(root_children))})
-    merged["dependencies"].extend(dep_entries)
+    # PRUNE DANGLING EDGES. De-duplicating components can leave `dependsOn`
+    # entries pointing at refs that no longer exist, and entries whose own
+    # `ref` was dropped. An independent scorer (sbomqs) counted 767 "components"
+    # on a 652-component BOM for exactly this reason - the graph was asserting
+    # things that were not there. A reference to a component that does not
+    # exist is a false statement in a compliance document.
+    known = set(all_refs) | {root_ref}
+    pruned_targets = 0
+    pruned_entries = 0
+    clean_entries = []
+    for d in dep_entries:
+        if d.get("ref") not in known:
+            pruned_entries += 1
+            continue
+        before = len(d.get("dependsOn") or [])
+        d["dependsOn"] = [t for t in (d.get("dependsOn") or []) if t in known]
+        pruned_targets += before - len(d["dependsOn"])
+        clean_entries.append(d)
+
+    root_children = [r for r in dict.fromkeys(root_children) if r in known]
+    merged["dependencies"].append({"ref": root_ref, "dependsOn": root_children})
+    merged["dependencies"].extend(clean_entries)
+    if pruned_targets or pruned_entries:
+        print("[merge] pruned     : " + str(pruned_targets) + " dangling edge(s), "
+              + str(pruned_entries) + " orphaned graph entr(ies)")
     direct_n = len(dict.fromkeys(root_children))
     print("[merge] direct deps : " + str(direct_n) + " of " + str(len(all_refs))
           + " components (" + str(len(orphans)) + " orphans attached to root)")

@@ -405,6 +405,48 @@ def license_ids(comp: dict) -> list:
     return list(dict.fromkeys(out))
 
 
+def normalise_component_licenses(comp: dict) -> int:
+    """Write resolved SPDX identifiers back into the component.
+
+    Generators emit what the package claims. For Python that is a PyPI trove
+    classifier - "License :: OSI Approved :: Apache Software License" - which
+    is not an SPDX identifier, and CERT-In s3.4(b) asks for SPDX identifiers.
+
+    We already translate those to look up restrictions; this records the
+    translation in the document too. The original stays as the DECLARED
+    licence (what the package says about itself) and the SPDX identifier is
+    added as CONCLUDED (what we determined it means) - which is exactly what
+    those two CycloneDX terms mean, so nothing is overstated.
+
+    Returns how many concluded licences were added.
+    """
+    lics = comp.get("licenses") or []
+    if not lics:
+        return 0
+    have_spdx = set()
+    for l in lics:
+        node = l.get("license") or {}
+        if isinstance(node, dict) and node.get("id"):
+            have_spdx.add(node["id"])
+    added = 0
+    for l in list(lics):
+        node = l.get("license") or {}
+        if not isinstance(node, dict) or node.get("id") or not node.get("name"):
+            continue
+        node.setdefault("acknowledgement", "declared")
+        for chunk in str(node["name"]).split(","):
+            chunk = chunk.strip()
+            if not chunk.startswith("License ::"):
+                continue
+            spdx = CLASSIFIER_TO_SPDX.get(chunk)
+            if spdx and spdx not in have_spdx:
+                lics.append({"license": {"id": spdx,
+                                         "acknowledgement": "concluded"}})
+                have_spdx.add(spdx)
+                added += 1
+    return added
+
+
 def resolve_restrictions(comp: dict, table: dict) -> tuple:
     """-> (restrictions_text, category, risk, unrecognised_ids)
 
@@ -1097,6 +1139,7 @@ def main() -> int:
 
     eol_cache: dict = {}
     meta_cache: dict = {}
+    spdx_added = 0
     for comp in components:
         entry = {}
         for k in comp_keys(comp):
@@ -1142,6 +1185,10 @@ def main() -> int:
             desc = entry.get("description") or online.get("description")
             if desc:
                 comp["description"] = str(desc)
+
+        # Resolve trove classifiers into SPDX identifiers IN the document,
+        # not just for the lookup below.
+        spdx_added += normalise_component_licenses(comp)
 
         # usage restrictions (field 13): curated -> licence table -> flagged.
         # Never guessed: an unrecognised licence produces a loud marker so a
@@ -1190,6 +1237,10 @@ def main() -> int:
         set_prop(comp, "structured", entry.get("structured", st))
 
         set_prop(comp, "enrichedBy", "certin_enrich.py")
+
+    if spdx_added:
+        log("resolved " + str(spdx_added) + " non-SPDX licence name(s) to SPDX "
+            "identifiers (recorded as concluded; original kept as declared)")
 
     # ---- attach vulnerabilities (VDR) ------------------------------------
     if cdx_vulns:
