@@ -806,6 +806,64 @@ def load_declared_direct(paths: list) -> set:
     return names
 
 
+CVSS31_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+CVSS31_AC = {"L": 0.77, "H": 0.44}
+CVSS31_PR_U = {"N": 0.85, "L": 0.62, "H": 0.27}
+CVSS31_PR_C = {"N": 0.85, "L": 0.68, "H": 0.50}
+CVSS31_UI = {"N": 0.85, "R": 0.62}
+CVSS31_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+
+def cvss31_base_score(vector: str) -> Any:
+    """CVSS v3.x base score from a vector string, per the official formula.
+
+    Why bother: OSV supplies a severity LABEL for GitHub advisories but often
+    not for PYSEC ones, which then render as "unknown" even though the vector
+    is right there. On one real scan, 16 of 19 unrated findings carried a
+    v3.x vector. Returns None for v4.0 (a different formula - better unrated
+    than wrong) and for anything unparseable.
+    """
+    v = str(vector or "")
+    if not v.startswith("CVSS:3"):
+        return None
+    m = dict(p.split(":", 1) for p in v.split("/")[1:] if ":" in p)
+    try:
+        scope_changed = m["S"] == "C"
+        iss = 1 - ((1 - CVSS31_CIA[m["C"]]) * (1 - CVSS31_CIA[m["I"]])
+                   * (1 - CVSS31_CIA[m["A"]]))
+        if scope_changed:
+            impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+        else:
+            impact = 6.42 * iss
+        if impact <= 0:
+            return 0.0
+        pr = (CVSS31_PR_C if scope_changed else CVSS31_PR_U)[m["PR"]]
+        expl = 8.22 * CVSS31_AV[m["AV"]] * CVSS31_AC[m["AC"]] * pr * CVSS31_UI[m["UI"]]
+        raw = min((1.08 * (impact + expl)) if scope_changed else (impact + expl), 10)
+    except (KeyError, ValueError, OverflowError):
+        return None
+    # CVSS "Roundup": smallest one-decimal value >= raw
+    i = int(raw * 100000)
+    return float(i) / 100000 if i % 10000 == 0 else (int(i / 10000) + 1) / 10.0
+
+
+def severity_from_score(score: Any) -> str:
+    """CVSS qualitative band."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "unknown"
+    if s >= 9.0:
+        return "critical"
+    if s >= 7.0:
+        return "high"
+    if s >= 4.0:
+        return "medium"
+    if s > 0:
+        return "low"
+    return "none"
+
+
 def scan_osv(components: list) -> tuple:
     """Query OSV.dev for every component and return CycloneDX vulnerabilities.
 
@@ -877,29 +935,58 @@ def scan_osv(components: list) -> tuple:
             d = detail_cache.get(vid) or {}
             sev_label = "unknown"
             score = None
+            computed = None
             for sev in (d.get("severity") or []):
                 if sev.get("type", "").startswith("CVSS") and sev.get("score"):
                     score = sev["score"]
+                    if computed is None:
+                        computed = cvss31_base_score(score)
             db = d.get("database_specific") or {}
             if db.get("severity"):
                 sev_label = str(db["severity"]).lower()
+            elif computed is not None:
+                # No label from the advisory database, but a CVSS vector is
+                # present - score it rather than reporting "unknown".
+                sev_label = severity_from_score(computed)
+            # Fixed versions. OSV also publishes GIT ranges, whose "fixed"
+            # value is a commit SHA - advising a user to "upgrade to >=
+            # 74ea7cf7a6a2..." is useless, so only ecosystem/semver ranges
+            # are taken, with a SHA-shaped fallback filter for safety.
             fixed = set()
             for aff in (d.get("affected") or []):
                 for rng in (aff.get("ranges") or []):
+                    if str(rng.get("type", "")).upper() == "GIT":
+                        continue
                     for ev in (rng.get("events") or []):
-                        if ev.get("fixed"):
-                            fixed.add(str(ev["fixed"]))
+                        fv = str(ev.get("fixed") or "")
+                        if fv and not re.fullmatch(r"[0-9a-f]{7,40}", fv):
+                            fixed.add(fv)
+            # CERT-In field 8 asks for "CVE identifiers". OSV returns its own
+            # id (GHSA-/PYSEC-) and carries the CVE as an alias, so without
+            # this the SBOM contains zero CVE numbers - which is what an
+            # assessor looks for first.
+            aliases = [str(a) for a in (d.get("aliases") or [])]
+            cves = [a for a in aliases if a.startswith("CVE-")]
+            rating: dict = {"method": "CVSSv31" if str(score or "").startswith("CVSS:3")
+                            else "other", "severity": sev_label}
+            if score:
+                rating["vector"] = score
+            if computed is not None:
+                rating["score"] = computed
             rec = {
                 "id": vid,
                 "source": {"name": "OSV", "url": "https://osv.dev/vulnerability/" + vid},
                 "description": str(d.get("summary") or d.get("details") or "")[:1000],
-                "ratings": ([{"severity": sev_label,
-                              "method": "other",
-                              **({"vector": score} if score else {})}]
-                            if sev_label != "unknown" or score else []),
+                "ratings": [rating] if (sev_label != "unknown" or score) else [],
                 "affects": [{"ref": ref}],
                 "_fixVersions": sorted(fixed),
+                "_cves": cves,
             }
+            if cves:
+                rec["references"] = [
+                    {"id": c, "source": {"name": "NVD",
+                                         "url": "https://nvd.nist.gov/vuln/detail/" + c}}
+                    for c in cves]
             vulns.append(rec)
             for k in comp_keys(comp):
                 index.setdefault(k, []).append(rec)
@@ -1314,6 +1401,78 @@ def main() -> int:
                          + str(cov) + "/" + str(total) + " | "
                          + disp + "% | " + status + " | "
                          + srcmap[kind] + " |")
+        # ---- the findings themselves -------------------------------
+        # A report that says "59 vulnerabilities recorded" and then never
+        # names one makes the reader open a 500KB JSON to learn anything.
+        # cdx_vulns still carries the internal _fixVersions/_cves keys;
+        # bom["vulnerabilities"] has had them stripped for output.
+        vulns = cdx_vulns or (bom.get("vulnerabilities") or [])
+        if vulns:
+            sev_rank = {"critical": 4, "high": 3, "medium": 2,
+                        "moderate": 2, "low": 1}
+            # group by affected component
+            label_for = {}
+            for c in components:
+                lbl = ((str(c.get("group")) + "/") if c.get("group") else "")                     + str(c.get("name")) + "@" + str(c.get("version"))
+                for k in (c.get("bom-ref"), c.get("purl")):
+                    if k:
+                        label_for[k] = lbl
+            grouped: dict = {}
+            for v in vulns:
+                for aff in (v.get("affects") or []):
+                    key = label_for.get(aff.get("ref"), str(aff.get("ref")))
+                    grouped.setdefault(key, []).append(v)
+
+            def worst_of(vs):
+                return max((sev_rank.get(str(r.get("severity", "")).lower(), 0)
+                            for x in vs for r in (x.get("ratings") or [])),
+                           default=0)
+
+            def sev_of(v):
+                r = (v.get("ratings") or [{}])[0]
+                lab = str(r.get("severity", "unknown")).lower()
+                # GitHub says "moderate" where CVSS says "medium"; one band,
+                # one name, or the tally double-counts it.
+                return "medium" if lab == "moderate" else lab
+
+            counts: dict = {}
+            for v in vulns:
+                counts[sev_of(v)] = counts.get(sev_of(v), 0) + 1
+            tally = ", ".join(str(counts[k]) + " " + k for k in
+                              sorted(counts, key=lambda k: -sev_rank.get(k, 0)))
+
+            lines += ["", "## Vulnerability findings", "",
+                      "**" + str(len(vulns)) + " advisor"
+                      + ("y" if len(vulns) == 1 else "ies")
+                      + " affecting " + str(len(grouped))
+                      + " of " + str(total) + " components** — " + tally + ".",
+                      "",
+                      "Scanned against " + str(scan_source or "no source")
+                      + " at the SBOM timestamp above. An advisory match means a "
+                      "version range matches; it does not confirm the vulnerable "
+                      "code is reachable in this product.",
+                      "",
+                      "| Severity | Component | Advisories | Fix available | CVE / advisory ids |",
+                      "|---|---|---|---|---|"]
+            for comp_label in sorted(grouped,
+                                     key=lambda c: (-worst_of(grouped[c]),
+                                                    -len(grouped[c]), c)):
+                vs = grouped[comp_label]
+                sev = {4: "critical", 3: "high", 2: "medium",
+                       1: "low"}.get(worst_of(vs), "unrated")
+                fixes = sorted({f for x in vs for f in (x.get("_fixVersions") or [])})
+                fix = ("upgrade to >= " + fixes[-1]) if fixes else "none published"
+                ids = []
+                for x in vs:
+                    cves = x.get("_cves") or []
+                    ids.extend(cves if cves else [str(x.get("id"))])
+                shown = ", ".join(dict.fromkeys(ids[:3]))
+                if len(ids) > 3:
+                    shown += " +" + str(len(ids) - 3)
+                lines.append("| " + sev + " | `" + comp_label + "` | "
+                             + str(len(vs)) + " | " + fix + " | " + shown + " |")
+            lines.append("")
+
         if unscannable:
             lines += ["", "## Components that could NOT be scanned", "",
                       "**" + str(len(unscannable)) + " components have no version**, "
