@@ -49,6 +49,13 @@ SUPPORTED = {
     "package-lock.json": "npm",
     "requirements.txt": "python",
     "pom.xml": "maven",
+    "build.gradle": "gradle",
+    "build.gradle.kts": "gradle",
+    "build.sbt": "sbt",
+    # Swift: only LOCKFILES. Package.swift alone states ranges, not the
+    # versions actually in use - the same reason pom.xml needs Maven to run.
+    "Package.resolved": "swift",
+    "Podfile.lock": "swift",
 }
 
 # Detected and named, but no generator wired in yet. These appear in the
@@ -56,18 +63,30 @@ SUPPORTED = {
 UNSUPPORTED = {
     "yarn.lock": "npm (yarn lockfile - use cyclonedx-npm on package-lock, or add yarn support)",
     "pnpm-lock.yaml": "npm (pnpm lockfile)",
-    "build.gradle": "gradle",
-    "build.gradle.kts": "gradle",
-    "build.sbt": "sbt (Scala)",
     "go.mod": "go",
     "Cargo.lock": "rust",
     "Gemfile.lock": "ruby",
     "composer.lock": "php",
-    "Package.resolved": "swift",
+    "Package.swift": "swift (Package.swift with no committed Package.resolved - run `swift package resolve` and commit the lockfile)",
     "pyproject.toml": "python (pyproject - only if no requirements.txt beside it)",
     "poetry.lock": "python (poetry)",
     "Pipfile.lock": "python (pipenv)",
 }
+
+
+def outermost(dirs: list) -> list:
+    """Keep only directories with no ancestor in the list.
+
+    A Gradle or sbt build at a parent directory already aggregates its
+    sub-projects; running the generator again in each child would rebuild the
+    same dependencies several times and, for Gradle, can fail outright when a
+    child is not runnable on its own.
+    """
+    keep: list = []
+    for d in sorted(dirs, key=lambda x: (0 if x == "." else x.count("/") + 1, x)):
+        if d == "." or not any(k == "." or d.startswith(k + "/") for k in keep):
+            keep.append(d)
+    return keep
 
 
 def java_version_from_pom(pom_path: str) -> str | None:
@@ -86,6 +105,25 @@ def java_version_from_pom(pom_path: str) -> str | None:
         m = re.search(r"<" + re.escape(tag) + r">\s*(1\.)?(\d+)\s*</" + re.escape(tag) + ">", text)
         if m:
             return m.group(2)
+    return None
+
+
+def java_version_from_gradle(build_dir: str) -> str | None:
+    """Best-effort read of the Java version a Gradle build targets."""
+    for name in ("build.gradle", "build.gradle.kts"):
+        p = os.path.join(build_dir, name)
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for pat in (r"JavaLanguageVersion\.of\(\s*(\d+)\s*\)",
+                    r"jvmToolchain\(\s*(\d+)\s*\)",
+                    r"JavaVersion\.VERSION_(?:1_)?(\d+)",
+                    r"sourceCompatibility\s*=?\s*['\"]?(?:1\.)?(\d+)"):
+            m = re.search(pat, text)
+            if m:
+                return m.group(1)
     return None
 
 
@@ -137,6 +175,35 @@ def detect(root: str) -> dict:
     for k in found:
         found[k] = list(dict.fromkeys(found[k]))
 
+    # Package.swift is only a gap when no lockfile sits beside it.
+    key = UNSUPPORTED["Package.swift"]
+    if key in unsupported:
+        swift_dirs = set(found["swift"])
+        unsupported[key] = [p for p in unsupported[key]
+                            if (os.path.dirname(p) or ".") not in swift_dirs]
+        if not unsupported[key]:
+            del unsupported[key]
+
+    # A directory with BOTH pom.xml and build.gradle (Spring Petclinic ships
+    # both) is one project described twice. Maven is proven here, so it wins
+    # and Gradle is skipped for that directory - recorded, not silent.
+    skipped: list = []
+    maven_set = set(found["maven"])
+    both = [d for d in found["gradle"] if d in maven_set]
+    for d in both:
+        skipped.append({"dir": d, "ecosystem": "gradle",
+                        "reason": "pom.xml in the same directory; Maven used instead"})
+    found["gradle"] = [d for d in found["gradle"] if d not in maven_set]
+
+    # Multi-module Gradle and sbt builds: generate once at the outermost build.
+    for eco in ("gradle", "sbt"):
+        kept = outermost(found[eco])
+        for d in found[eco]:
+            if d not in kept:
+                skipped.append({"dir": d, "ecosystem": eco,
+                                "reason": "covered by the enclosing build"})
+        found[eco] = kept
+
     # Files naming a Python project's DIRECT dependencies. requirements.txt is
     # frequently pip-freeze output - every package, transitives included - so
     # it cannot say what the developer asked for. requirements.in (pip-tools)
@@ -150,22 +217,32 @@ def detect(root: str) -> dict:
             if os.path.isfile(os.path.join(base, cand)):
                 python_direct_files.append((d + "/" if d != "." else "") + cand)
 
-    java_version = None
+    java_version, java_source = None, "default"
     for d in found["maven"]:
         v = java_version_from_pom(os.path.join(root, d, "pom.xml"))
         if v:
-            java_version = v
+            java_version, java_source = v, "pom.xml"
             break
+    if not java_version:
+        for d in found["gradle"]:
+            v = java_version_from_gradle(root if d == "." else os.path.join(root, d))
+            if v:
+                java_version, java_source = v, "build.gradle"
+                break
 
     result = {
         "root": root,
         "npm": found["npm"],
         "python": found["python"],
         "maven": found["maven"],
+        "gradle": found["gradle"],
+        "sbt": found["sbt"],
+        "swift": found["swift"],
         "java_version": java_version or "17",
-        "java_version_source": "pom.xml" if java_version else "default",
+        "java_version_source": java_source,
         "maven_settings": find_maven_settings(root) if found["maven"] else None,
         "python_direct_files": python_direct_files,
+        "skipped": skipped,
         "unsupported": unsupported,
         "any_supported": any(found.values()),
     }
@@ -191,6 +268,15 @@ def main() -> int:
             f.write("python_dirs=" + " ".join(r["python"]) + "\n")
             f.write("python_direct_files=" + " ".join(r["python_direct_files"]) + "\n")
             f.write("maven_dirs=" + " ".join(r["maven"]) + "\n")
+            f.write("has_gradle=" + ("1" if r["gradle"] else "0") + "\n")
+            f.write("gradle_dirs=" + " ".join(r["gradle"]) + "\n")
+            f.write("has_sbt=" + ("1" if r["sbt"] else "0") + "\n")
+            f.write("sbt_dirs=" + " ".join(r["sbt"]) + "\n")
+            f.write("has_swift=" + ("1" if r["swift"] else "0") + "\n")
+            f.write("swift_dirs=" + " ".join(r["swift"]) + "\n")
+            # one JDK serves Maven, Gradle and sbt
+            f.write("has_jvm=" + ("1" if (r["maven"] or r["gradle"] or r["sbt"]) else "0") + "\n")
+            f.write("skipped_json=" + json.dumps(r["skipped"]) + "\n")
             f.write("java_version=" + r["java_version"] + "\n")
             f.write("maven_settings=" + (r["maven_settings"] or "") + "\n")
             f.write("has_unsupported=" + ("1" if r["unsupported"] else "0") + "\n")

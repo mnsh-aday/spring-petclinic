@@ -133,12 +133,15 @@ jobs:
       # JDK version comes from the pom; settings file from wherever the
       # repo's own CI keeps it.
       # -------------------------------------------------------------------
+      # One JDK serves Maven, Gradle and sbt. The Maven cache is only
+      # requested when there is a pom.xml - setup-java errors if asked to
+      # cache an ecosystem with no files to key on.
       - uses: actions/setup-java@v4
-        if: steps.detect.outputs.has_maven == '1'
+        if: steps.detect.outputs.has_jvm == '1'
         with:
           distribution: temurin
           java-version: ${{ steps.detect.outputs.java_version }}
-          cache: maven
+          cache: ${{ steps.detect.outputs.has_maven == '1' && 'maven' || '' }}
 
       - name: Maven SBOMs
         if: steps.detect.outputs.has_maven == '1'
@@ -167,6 +170,109 @@ jobs:
           done
 
       # -------------------------------------------------------------------
+      # GRADLE - the official CycloneDX Gradle plugin, applied through an
+      # INIT SCRIPT so the project's own build files are never edited. Like
+      # the Maven plugin it records what Gradle actually resolved after
+      # conflict resolution, not the ranges written in build.gradle.
+      # Uses the project's ./gradlew when it ships one, so the project's own
+      # Gradle version is honoured.
+      # -------------------------------------------------------------------
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.detect.outputs.has_gradle == '1'
+
+      - name: Gradle SBOMs
+        if: steps.detect.outputs.has_gradle == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.gradle_dirs }}
+        run: |
+          set -euo pipefail
+          INIT="$RUNNER_TEMP/cyclonedx.init.gradle"
+          cat > "$INIT" <<'EOF'
+          initscript {
+            repositories { gradlePluginPortal() }
+            dependencies { classpath "org.cyclonedx.bom:org.cyclonedx.bom.gradle.plugin:3.5.1" }
+          }
+          rootProject {
+            apply plugin: org.cyclonedx.gradle.CyclonedxPlugin
+          }
+          EOF
+          ROOT=$(pwd)
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::gradle: $d"
+            ( cd "$d"
+              if [ -f ./gradlew ]; then chmod +x ./gradlew; G=./gradlew; else G=gradle; fi
+              echo "using: $G"
+              $G --no-daemon --init-script "$INIT" cyclonedxBom )
+            found="$d/build/reports/cyclonedx/bom.json"
+            [ -f "$found" ] || { echo "::error::gradle produced no build/reports/cyclonedx/bom.json in $d"; exit 1; }
+            cp "$found" "boms/gradle-$safe.json"
+            echo "wrote boms/gradle-$safe.json"
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
+      # SBT (Scala) - the official sbt-sbom plugin, installed as a GLOBAL
+      # plugin so the project's build files are never edited. Requires the
+      # project to use sbt 1.10.11 or newer (the plugin's minimum).
+      # Multi-project builds write one BOM per sub-project; all are kept and
+      # merged below.
+      # -------------------------------------------------------------------
+      - uses: sbt/setup-sbt@v1
+        if: steps.detect.outputs.has_sbt == '1'
+
+      - name: sbt SBOMs
+        if: steps.detect.outputs.has_sbt == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.sbt_dirs }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.sbt/1.0/plugins
+          echo 'addSbtPlugin("com.github.sbt" %% "sbt-sbom" % "0.5.0")' > ~/.sbt/1.0/plugins/sbom.sbt
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::sbt: $d"
+            # `set every` reaches every sub-project's own setting; a plain
+            # ThisBuild setting would be overridden by the plugin's defaults.
+            ( cd "$d" && sbt -batch 'set every bomSchemaVersion := "1.6"' makeBom )
+            n=0
+            while IFS= read -r f; do
+              n=$((n+1)); cp "$f" "boms/sbt-$safe-$n.json"; echo "wrote boms/sbt-$safe-$n.json  <- $f"
+            done < <(find "$d" -path '*/target/*' -name '*.bom.json' -not -path '*/project/*')
+            [ "$n" -gt 0 ] || { echo "::error::sbt produced no .bom.json under $d/target"; exit 1; }
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
+      # SWIFT - Syft reading the Swift LOCKFILES (Package.resolved for Swift
+      # Package Manager, Podfile.lock for CocoaPods). A lockfile pins exact
+      # versions, so reading it is accurate - the same reason npm lockfiles
+      # work. Only Syft's Swift catalogers run, so files belonging to other
+      # ecosystems in the same directory are not counted twice.
+      # -------------------------------------------------------------------
+      - uses: anchore/sbom-action/download-syft@v0
+        id: syft
+        if: steps.detect.outputs.has_swift == '1'
+        with:
+          syft-version: v1.55.0
+
+      - name: Swift SBOMs
+        if: steps.detect.outputs.has_swift == '1'
+        env:
+          DIRS: ${{ steps.detect.outputs.swift_dirs }}
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          for d in $DIRS; do
+            safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
+            echo "::group::swift: $d"
+            "$SYFT" scan "dir:$d" --select-catalogers swift \
+              -o "cyclonedx-json@1.6=boms/swift-$safe.json"
+            echo "wrote boms/swift-$safe.json"
+            echo "::endgroup::"
+          done
+
+      # -------------------------------------------------------------------
       # GUARD - every detected ecosystem must have produced a BOM.
       # Silent partial success is the failure mode this whole project keeps
       # running into; refuse it explicitly.
@@ -176,11 +282,15 @@ jobs:
           HAS_PY: ${{ steps.detect.outputs.has_python }}
           HAS_NPM: ${{ steps.detect.outputs.has_npm }}
           HAS_MVN: ${{ steps.detect.outputs.has_maven }}
+          HAS_GRADLE: ${{ steps.detect.outputs.has_gradle }}
+          HAS_SBT: ${{ steps.detect.outputs.has_sbt }}
+          HAS_SWIFT: ${{ steps.detect.outputs.has_swift }}
         run: |
           fail=0
           chk() { if [ "$1" = "1" ] && ! ls boms/$2-*.json >/dev/null 2>&1; then
                     echo "::error::$2 was detected but produced no SBOM"; fail=1; fi; }
           chk "$HAS_PY" python; chk "$HAS_NPM" npm; chk "$HAS_MVN" maven
+          chk "$HAS_GRADLE" gradle; chk "$HAS_SBT" sbt; chk "$HAS_SWIFT" swift
           echo "BOMs produced:"; ls -1 boms/
           exit $fail
 
@@ -228,14 +338,23 @@ jobs:
         if: always()
         env:
           UNSUP: ${{ steps.detect.outputs.unsupported_json }}
+          SKIPPED: ${{ steps.detect.outputs.skipped_json }}
         run: |
           {
             echo "## Detected"
             echo '```'
             echo "python : ${{ steps.detect.outputs.python_dirs || '-' }}"
             echo "npm    : ${{ steps.detect.outputs.npm_dirs || '-' }}"
-            echo "maven  : ${{ steps.detect.outputs.maven_dirs || '-' }}  (JDK ${{ steps.detect.outputs.java_version }})"
+            echo "maven  : ${{ steps.detect.outputs.maven_dirs || '-' }}"
+            echo "gradle : ${{ steps.detect.outputs.gradle_dirs || '-' }}"
+            echo "sbt    : ${{ steps.detect.outputs.sbt_dirs || '-' }}"
+            echo "swift  : ${{ steps.detect.outputs.swift_dirs || '-' }}"
+            echo "JDK    : ${{ steps.detect.outputs.java_version }}"
             echo '```'
+            if [ -n "$SKIPPED" ] && [ "$SKIPPED" != "[]" ]; then
+              echo "**Deliberately not generated** (covered another way):"
+              echo '```'; echo "$SKIPPED" | python -m json.tool; echo '```'
+            fi
             if [ -n "$UNSUP" ] && [ "$UNSUP" != "{}" ]; then
               echo "## :warning: Detected but NOT yet supported"
               echo "These ecosystems exist in this repo and are **absent from the SBOM**:"

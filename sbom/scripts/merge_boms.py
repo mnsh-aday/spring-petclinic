@@ -60,6 +60,20 @@ def flatten(components: Any) -> list:
             if not isinstance(c, dict):
                 continue
             children = c.pop("components", None)
+            # Not software: generators can list the files they READ (Syft
+            # records the Swift lockfile itself, named by an absolute path on
+            # the build machine). A lockfile is the recipe, not an ingredient
+            # - it has no version and no package identity, so left in it
+            # becomes a permanent "unscannable component" and leaks CI paths.
+            # Narrow on purpose: CycloneDX also uses "file" for real shipped
+            # artefacts (a vendored binary, say), which carry a version or a
+            # package URL and are kept. Only identity-less file records go.
+            if (str(c.get("type", "")).lower() == "file"
+                    and not c.get("purl") and not c.get("version")):
+                FILE_COMPONENTS_DROPPED.append(c.get("name"))
+                if children:
+                    walk(children, parent_ref)
+                continue
             out.append(c)
             ref = c.get("bom-ref") or c.get("purl")
             if children:
@@ -80,6 +94,8 @@ def flatten(components: Any) -> list:
 # Edges recovered from nesting, folded into the merged graph so the
 # parent/child relationship is not lost when components are flattened.
 NESTED_EDGES: list = []
+# Components of type "file" removed during flattening (see flatten()).
+FILE_COMPONENTS_DROPPED: list = []
 
 
 def load(path: str) -> dict:
@@ -251,6 +267,9 @@ def main() -> int:
         print("[merge] pruned     : " + str(pruned_targets) + " dangling edge(s), "
               + str(pruned_entries) + " orphaned graph entr(ies)")
     direct_n = len(dict.fromkeys(root_children))
+    if FILE_COMPONENTS_DROPPED:
+        print("[merge] dropped    : " + str(len(FILE_COMPONENTS_DROPPED))
+              + " file-type component(s) - inputs the generator read, not software")
     print("[merge] direct deps : " + str(direct_n) + " of " + str(len(all_refs))
           + " components (" + str(len(orphans)) + " orphans attached to root)")
 
