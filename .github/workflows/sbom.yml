@@ -24,12 +24,23 @@
 name: SBOM
 
 on:
+  # Without a push trigger nothing ever regenerated the SBOM, and the
+  # inventory copy went stale the moment the code changed.
+  push:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       offline:
         description: "Skip registry lookups and OSV scan (company repos, until data egress is approved)"
         type: boolean
         default: false
+      fail-on-missing:
+        description: "CERT-In field keys required on every component"
+        type: string
+        default: ""
+      min-coverage:
+        type: number
+        default: 0
   workflow_call:
     inputs:
       offline:
@@ -53,10 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SBOM_TOOLS: sbom/scripts
-      # Promoted to job level so a step-level `if:` can test them - the
-      # `secrets` context is not available inside step conditionals.
-      INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
-      INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
+      # The inventory token is NOT set here. At job level every step could
+      # read it, including third-party code fetched by npx and pip.
     steps:
       - uses: actions/checkout@v4
 
@@ -66,8 +75,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Pinned: an unpinned generator can change the SBOM's shape with no
+      # change to this repository. This tooling lives in the RUNNER's Python,
+      # never in a venv that gets scanned.
       - name: Install SBOM tooling
-        run: pip install --quiet pyyaml cyclonedx-bom
+        run: >
+          pip install --quiet "pyyaml==6.0.2" "cyclonedx-bom==7.5.0"
+          "cyclonedx-python-lib[json-validation]"
 
       # -------------------------------------------------------------------
       # DETECT - the only step that looks at the repo's shape.
@@ -82,6 +96,14 @@ jobs:
       # -------------------------------------------------------------------
       # PYTHON - one venv per requirements.txt, scanned in environment mode
       # (requirements mode gives 0% licences; environment mode gives 100%).
+      #
+      # The venv holds the project's packages and NOTHING else: created
+      # without pip, filled by the runner's pip (--python), scanned by the
+      # runner's cyclonedx-py. Installing cyclonedx-bom into the scanned venv
+      # put 32 tooling packages in the SBOM and silently upgraded the
+      # project's chardet 3.0.4 (LGPL) to 7.6.0 (0BSD).
+      # `pip check` fails the run on a broken environment; pip's resolver
+      # only prints an ERROR and exits 0.
       # -------------------------------------------------------------------
       - name: Python SBOMs
         if: steps.detect.outputs.has_python == '1'
@@ -92,11 +114,11 @@ jobs:
           for d in $DIRS; do
             safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
             echo "::group::python: $d"
-            python -m venv ".venv-$safe"
-            ".venv-$safe/bin/pip" install --quiet --upgrade pip
-            ".venv-$safe/bin/pip" install --quiet -r "$d/requirements.txt"
-            ".venv-$safe/bin/pip" install --quiet cyclonedx-bom
-            ".venv-$safe/bin/cyclonedx-py" environment ".venv-$safe" \
+            python -m venv --without-pip ".venv-$safe"
+            VPY="$PWD/.venv-$safe/bin/python"
+            python -m pip --python "$VPY" install --quiet -r "$d/requirements.txt"
+            python -m pip --python "$VPY" check
+            cyclonedx-py environment ".venv-$safe" \
               --of json --sv 1.6 -o "boms/python-$safe.json"
             echo "wrote boms/python-$safe.json"
             echo "::endgroup::"
@@ -108,7 +130,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.detect.outputs.has_npm == '1'
         with:
-          node-version: '20'
+          node-version: '22'   # Node 20 reached end of life 2026-04-30
 
       - name: npm SBOMs
         if: steps.detect.outputs.has_npm == '1'
@@ -120,7 +142,7 @@ jobs:
           for d in $DIRS; do
             safe=$(echo "$d" | sed 's#[/.]#_#g'); [ "$d" = "." ] && safe=root
             echo "::group::npm: $d"
-            ( cd "$d" && npx --yes @cyclonedx/cyclonedx-npm@latest \
+            ( cd "$d" && npx --yes @cyclonedx/cyclonedx-npm@6.0.1 \
                 --package-lock-only --output-format json --spec-version 1.6 \
                 --output-file "$ROOT/boms/npm-$safe.json" )
             echo "wrote boms/npm-$safe.json"
@@ -159,7 +181,10 @@ jobs:
             # Pinned to the version that produced 106/106 components WITH
             # hashes on spring-petclinic (2026-09-10). Unpinned, a plugin
             # release could change SBOM shape without any code change.
-            mvn -B -f "$d/pom.xml" $SFLAG \
+            # The project's own wrapper when it has one, so the Maven version
+            # matches what the project builds with, not whatever the runner has.
+            MVN=mvn; [ -x "$d/mvnw" ] && MVN="$d/mvnw"
+            "$MVN" -B -f "$d/pom.xml" $SFLAG \
               org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
               -DoutputFormat=json -DoutputName=bom -DschemaVersion=1.6
             found=$(find "$d" -path '*/target/bom.json' | head -1)
@@ -297,12 +322,19 @@ jobs:
       # -------------------------------------------------------------------
       # MERGE - one SBOM per delivered product, as CERT-In expects.
       # -------------------------------------------------------------------
+      # A root-level Maven project IS the product, so its purl, version,
+      # licence and supplier become the SBOM's subject; otherwise the subject
+      # is only the repository name and commit.
       - name: Merge
         run: |
+          PRIMARY=()
+          [ -f boms/maven-root.json ] && PRIMARY=(--primary boms/maven-root.json)
           python "$SBOM_TOOLS/merge_boms.py" -o bom.json \
             --name "${{ github.event.repository.name }}" \
             --version "${{ github.sha }}" \
-            boms/*.json
+            --revision "${{ github.sha }}" \
+            --vcs-url "${{ github.server_url }}/${{ github.repository }}" \
+            "${PRIMARY[@]}" boms/*.json
 
       # -------------------------------------------------------------------
       # ENRICH + SCAN - fills the 21 CERT-In fields, including 8 and 9 from
@@ -329,6 +361,11 @@ jobs:
             --metadata sbom/sbom-metadata.yml \
             --report certin-compliance.md \
             "${ARGS[@]}"
+
+      # An SBOM that does not validate is not an SBOM. This step is how a
+      # bom.certin.json with 25 schema errors would have been stopped.
+      - name: Validate against the CycloneDX schema
+        run: python "$SBOM_TOOLS/validate_bom.py" bom.json bom.certin.json
 
       # -------------------------------------------------------------------
       # SUMMARY - the report, plus any ecosystem we saw but cannot yet
@@ -368,12 +405,27 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SBOM
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: sbom-certin
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
+          path: |
+            bom.certin.json
+            bom.json
+            certin-compliance.md
+            boms/
+
+      # A failed run's partial outputs are still useful for debugging, but
+      # under a name nobody will mistake for a finished SBOM.
+      - name: Upload partial outputs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-certin-FAILED-partial
+          retention-days: 7
+          if-no-files-found: ignore
           path: |
             bom.certin.json
             bom.json
@@ -383,7 +435,7 @@ jobs:
       # -------------------------------------------------------------------
       # PUBLISH TO THE CENTRAL INVENTORY
       #
-      # Build artifacts expire (90 days), so they cannot be what the nightly
+      # Build artifacts expire (retention-days above), so they cannot be what the nightly
       # sweep re-checks. One SBOM per repository is committed to an inventory
       # repository instead, overwritten on each push - the current truth for
       # this project, kept for as long as the repository exists.
@@ -397,8 +449,25 @@ jobs:
       #                         scoped to ONLY that inventory repo
       # Set them as organisation secrets so every repo inherits them.
       # -------------------------------------------------------------------
+      # The secrets context cannot be used in a step `if:`, so this step
+      # turns "are they set" into an output without exposing the values.
+      - name: Check inventory configuration
+        id: inv
+        env:
+          INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
+          INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
+        run: |
+          if [ -n "$INVENTORY_REPO" ] && [ -n "$INVENTORY_TOKEN" ]; then
+            echo "configured=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish SBOM to the inventory
-        if: env.INVENTORY_REPO != '' && env.INVENTORY_TOKEN != '' && success()
+        if: steps.inv.outputs.configured == '1' && success()
+        env:
+          INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
+          INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
         run: |
           set -euo pipefail
           SLUG=$(echo "${{ github.repository }}" | tr '/' '_')
@@ -406,15 +475,37 @@ jobs:
             "https://x-access-token:${INVENTORY_TOKEN}@github.com/${INVENTORY_REPO}.git" \
             _inventory
           mkdir -p "_inventory/sboms"
-          cp bom.certin.json "_inventory/sboms/${SLUG}.cdx.json"
-          cd _inventory
-          if git diff --quiet -- "sboms/${SLUG}.cdx.json"; then
+          DEST="_inventory/sboms/${SLUG}.cdx.json"
+          # Compare CONTENT, ignoring what changes on every run (serial,
+          # timestamps, commit). Byte comparison republished on every run.
+          if [ -f "$DEST" ] && python - "$DEST" bom.certin.json <<'PY'
+          import json, sys
+          VOLATILE = {"certin:vulnScanTime", "certin:derivedFromSerial", "certin:vcsRevision"}
+          def norm(p):
+              b = json.load(open(p, encoding="utf-8"))
+              b.pop("serialNumber", None)
+              md = b.get("metadata") or {}
+              md.pop("timestamp", None)
+              md["properties"] = [x for x in md.get("properties") or []
+                                  if x.get("name") not in VOLATILE]
+              return b
+          sys.exit(0 if norm(sys.argv[1]) == norm(sys.argv[2]) else 1)
+          PY
+          then
             echo "SBOM unchanged for ${{ github.repository }} - nothing to publish"
             exit 0
           fi
+          cp bom.certin.json "$DEST"
+          cd _inventory
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Staged before the check: `git diff` ignores untracked files, so a
+          # repository's FIRST SBOM always looked "unchanged" and never published.
           git add "sboms/${SLUG}.cdx.json"
+          if git diff --cached --quiet; then
+            echo "SBOM unchanged for ${{ github.repository }} - nothing to publish"
+            exit 0
+          fi
           git commit -m "SBOM: ${{ github.repository }} @ ${{ github.sha }}"
           # Another repo may publish at the same moment; rebase and retry.
           for i in 1 2 3; do
@@ -427,6 +518,6 @@ jobs:
           exit 1
 
       - name: Note when publishing is not configured
-        if: env.INVENTORY_REPO == ''
+        if: steps.inv.outputs.configured == '0'
         run: |
           echo "> SBOM not published to a central inventory - \`SBOM_INVENTORY_REPO\` is not set. The nightly sweep will not see this project." >> "$GITHUB_STEP_SUMMARY"

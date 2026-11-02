@@ -27,21 +27,43 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 
 
 
 def comp_key(c: dict) -> str:
-    """Identity for de-duplication."""
+    """Identity for de-duplication.
+
+    Qualifiers are dropped (one jar is the same with or without ?type=jar)
+    EXCEPT `classifier`: netty-...:linux-x86_64 and :osx-aarch_64 are
+    different files, and keying on the bare purl silently dropped one.
+    """
     purl = c.get("purl")
     if purl:
-        return purl.split("?")[0]
+        base, _, quals = purl.partition("?")
+        cls = [q for q in quals.split("&") if q.startswith("classifier=")]
+        return base + ("?" + cls[0] if cls else "")
     return str(c.get("name")) + "@" + str(c.get("version"))
+
+
+def tool_entry(e: dict) -> dict:
+    """A tools.components entry that is valid CycloneDX 1.6.
+
+    Legacy (1.4-style) tool entries use `vendor`, which a component does not
+    have, and may lack the required `type`.
+    """
+    out = {k: v for k, v in e.items()
+           if k in ("type", "group", "name", "version", "publisher", "author")}
+    if e.get("vendor") and "publisher" not in out:
+        out["publisher"] = e["vendor"]
+    out.setdefault("type", "application")
+    return out
 
 
 def flatten(components: Any) -> list:
@@ -117,6 +139,13 @@ def main() -> int:
                     help="version of the merged root component")
     ap.add_argument("--spec-version", default=None,
                     help="force a specVersion; default = highest among inputs")
+    ap.add_argument("--primary", default=None, metavar="BOM",
+                    help="input whose root component IS the product (e.g. the "
+                         "Maven BOM of the application); its purl, version, "
+                         "licence and supplier become the merged root's")
+    ap.add_argument("--revision", default=None,
+                    help="VCS commit the SBOM was built from")
+    ap.add_argument("--vcs-url", default=None, help="repository URL")
     args = ap.parse_args()
 
     boms = [(p, load(p)) for p in args.inputs]
@@ -142,12 +171,43 @@ def main() -> int:
             key = (e.get("name"), e.get("version"))
             if e.get("name") and key not in seen_tools:
                 seen_tools.add(key)
-                tools.append({k: v for k, v in e.items()
-                              if k in ("vendor", "name", "version", "type")})
+                tools.append(tool_entry(e))
     tools.append({"name": "merge_boms.py", "version": TOOL_VERSION,
                   "type": "application"})
 
     root_ref = "root-" + args.name
+    root: dict = {"bom-ref": root_ref, "type": "application",
+                  "name": args.name, "version": args.version}
+    # The product's identity. Without this the merged root was only a name
+    # and a git SHA: no purl, no licence, no supplier, no real version.
+    # Description and links are NOT copied - a Maven root inherits them from
+    # its parent POM ("Parent pom providing dependency..." for Spring Boot).
+    if args.primary:
+        prim = next((b for p, b in boms
+                     if os.path.normcase(os.path.abspath(p))
+                     == os.path.normcase(os.path.abspath(args.primary))), None)
+        if prim is None:
+            print("[merge] ERROR --primary is not one of the inputs: "
+                  + args.primary, file=sys.stderr)
+            return 2
+        pc = (prim.get("metadata") or {}).get("component") or {}
+        for k in ("group", "name", "version", "purl", "licenses",
+                  "supplier", "publisher", "hashes"):
+            if pc.get(k):
+                root[k] = pc[k]
+    props: list = []
+    if args.revision:
+        props.append({"name": "certin:vcsRevision", "value": args.revision})
+    if args.vcs_url:
+        root["externalReferences"] = [{"type": "vcs", "url": args.vcs_url}]
+    # Which dependency scopes each generator included. Dropping this left the
+    # merged SBOM silent on the 65 test-scope dependencies it excludes.
+    for p, b in boms:
+        for pr in ((b.get("metadata") or {}).get("properties") or []):
+            if pr.get("name") == "maven.scopes":
+                props.append({"name": "certin:includedScopes:"
+                              + p.replace("\\", "/").split("/")[-1],
+                              "value": pr.get("value")})
     merged: dict = {
         "bomFormat": "CycloneDX",
         "specVersion": spec,
@@ -160,16 +220,12 @@ def main() -> int:
             # CycloneDX's native field for WHEN in the lifecycle this was taken.
             # CERT-In s3.2 calls the same thing an SBOM "classification".
             "lifecycles": [{"phase": "build"}],
-            "component": {
-                "bom-ref": root_ref,
-                "type": "application",
-                "name": args.name,
-                "version": args.version,
-            },
+            "component": root,
             "tools": {"components": tools},
             # Licence of the SBOM DOCUMENT itself, not of its contents.
             # CC0 is the convention, matching SPDX's dataLicense.
             "licenses": [{"license": {"id": "CC0-1.0"}}],
+            **({"properties": props} if props else {}),
         },
         "components": [],
         "dependencies": [],
@@ -177,6 +233,7 @@ def main() -> int:
     }
 
     seen_keys: dict = {}
+    alias: dict = {}             # bom-ref of a dropped duplicate -> kept ref
     root_children: list = []     # ONLY true direct deps + orphans, never everything
     dep_entries: list = []
     all_refs: list = []          # every kept component's ref
@@ -199,6 +256,12 @@ def main() -> int:
             k = comp_key(c)
             if k in seen_keys:
                 dropped += 1
+                # Edges that pointed at the dropped copy must follow it to the
+                # kept one; pruning them would cut real dependencies.
+                mine = c.get("bom-ref") or c.get("purl")
+                kept = seen_keys[k].get("bom-ref") or seen_keys[k].get("purl")
+                if mine and kept and mine != kept:
+                    alias[mine] = kept
                 continue
             props = c.setdefault("properties", [])
             if not any(p.get("name") == "certin:sourceBom" for p in props):
@@ -233,6 +296,20 @@ def main() -> int:
     dep_entries.extend(NESTED_EDGES)
     for e in NESTED_EDGES:
         reached.update(e.get("dependsOn") or [])
+
+    if alias:
+        by_ref: dict = {}
+        for d in dep_entries:
+            r = alias.get(d.get("ref"), d.get("ref"))
+            tgt = [alias.get(t, t) for t in (d.get("dependsOn") or [])]
+            if r in by_ref:
+                by_ref[r]["dependsOn"].extend(tgt)
+            else:
+                by_ref[r] = {"ref": r, "dependsOn": tgt}
+        dep_entries = [{"ref": e["ref"], "dependsOn": list(dict.fromkeys(e["dependsOn"]))}
+                       for e in by_ref.values()]
+        root_children = [alias.get(t, t) for t in root_children]
+        reached = {alias.get(t, t) for t in reached}
 
     # Orphans: components no edge points at. Happens when a generator emits no
     # graph at all (then ALL its components are orphans, which correctly makes

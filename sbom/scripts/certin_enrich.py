@@ -2,8 +2,8 @@
 """
 certin_enrich.py -- turn a generic CycloneDX SBOM into a CERT-In compliant one.
 
-CERT-In "Technical Guidelines on SBOM" v1.0 (03.10.2024) section 4.2 mandates 21
-data fields per component. Standard generators (Syft, cdxgen, cyclonedx-*) emit
+CERT-In "Technical Guidelines on SBOM" section 4.2 mandates 21 data fields per
+component (v1.0, 03.10.2024; unchanged in v2.0, 09.07.2025). Standard generators (Syft, cdxgen, cyclonedx-*) emit
 roughly half. This script fills the rest from three sources, in priority order:
 
   1. What the generator already produced        (never overwritten)
@@ -30,12 +30,15 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
 PROP_NS = "certin"
+TOOL_VERSION = "1.2.0"
 HTTP_TIMEOUT = 8
+GUIDELINE = "CERT-In Technical Guidelines on SBOM v2.0 (09.07.2025)"
 
 # ---------------------------------------------------------------------------
 # The 21 CERT-In section 4.2 data fields, and where each lives in CycloneDX.
@@ -68,6 +71,9 @@ CERTIN_FIELDS: "OrderedDict[str, tuple]" = OrderedDict([
 ARCHIVE_EXT = (".jar", ".war", ".ear", ".zip", ".tar", ".tar.gz", ".tgz",
                ".whl", ".egg", ".nupkg", ".gem", ".apk", ".aar", ".crate")
 EXEC_EXT = (".exe", ".sh", ".bat", ".cmd", ".bin", ".ps1", ".dll", ".so", ".dylib")
+# Extensions only count at the END of a name. As a substring test, ".bin"
+# matched "jakarta.xml.bind-api" and marked an XML API jar executable.
+EXEC_RE = re.compile(r"(?:" + "|".join(re.escape(e) for e in EXEC_EXT) + r")$")
 
 # PURL name fragment -> endoflife.date product slug. High-confidence only.
 EOL_SLUGS = {
@@ -120,6 +126,31 @@ CLASSIFIER_TO_SPDX = {
     "License :: OSI Approved :: Eclipse Public License 2.0 (EPL-2.0)": "EPL-2.0",
     "License :: OSI Approved :: The Unlicense (Unlicense)": "Unlicense",
     "License :: Public Domain": "CC0-1.0",
+}
+
+# Free-text licence names that Maven POMs actually carry, mapped to SPDX.
+# Unmapped spellings are not matched against the restrictions table: "EPL 1.0"
+# went unrecognised and rated h2 high-risk although EPL-1.0 is medium.
+NAME_TO_SPDX = {
+    "EPL 1.0": "EPL-1.0",
+    "Eclipse Public License 1.0": "EPL-1.0",
+    "Eclipse Public License - v 1.0": "EPL-1.0",
+    "Eclipse Public License v2.0": "EPL-2.0",
+    "Openfont-1.1": "OFL-1.1",
+    "SIL Open Font License 1.1": "OFL-1.1",
+    "The GNU General Public License, v2 with Universal FOSS Exception, v1.0":
+        "GPL-2.0-only WITH Universal-FOSS-exception-1.0",
+    "The Apache Software License, Version 2.0": "Apache-2.0",
+    "Apache License, Version 2.0": "Apache-2.0",
+    "MIT License": "MIT",
+    "The MIT License": "MIT",
+}
+
+# Deprecated SPDX ids -> current expression.
+DEPRECATED_SPDX = {
+    "GPL-2.0-with-classpath-exception": "GPL-2.0-only WITH Classpath-exception-2.0",
+    "GPL-2.0": "GPL-2.0-only",
+    "LGPL-2.1": "LGPL-2.1-only",
 }
 
 
@@ -398,11 +429,24 @@ def license_ids(comp: dict) -> list:
                 if chunk.startswith("License ::"):
                     out.append(normalise_license(chunk))
                     continue
-                for tok in re.split(r"\s+(?:OR|AND|WITH)\s+", chunk):
+                chunk = NAME_TO_SPDX.get(chunk, chunk)
+                for tok in re.split(r"\s+(?:OR|AND)\s+", chunk):
                     tok = tok.strip("()").strip()
-                    if tok:
-                        out.append(normalise_license(tok))
-    return list(dict.fromkeys(out))
+                    if not tok:
+                        continue
+                    # "X WITH exception" is one licence, not two: the exception
+                    # is not a licence of its own and would always read as
+                    # unrecognised. Keyed by the table's legacy id where one
+                    # exists, else by the base licence (the stricter reading).
+                    base, _, exc = tok.partition(" WITH ")
+                    if exc:
+                        legacy = {v: k for k, v in DEPRECATED_SPDX.items()}
+                        tok = legacy.get(tok.strip(), base.strip())
+                    out.append(normalise_license(tok))
+    out = list(dict.fromkeys(out))
+    if any(not o.startswith("LicenseRef-") for o in out):
+        out = [o for o in out if not o.startswith("LicenseRef-PyPI-")]
+    return out
 
 
 def normalise_component_licenses(comp: dict) -> int:
@@ -418,17 +462,49 @@ def normalise_component_licenses(comp: dict) -> int:
     added as CONCLUDED (what we determined it means) - which is exactly what
     those two CycloneDX terms mean, so nothing is overstated.
 
-    Returns how many concluded licences were added.
+    Free-text names with a known SPDX equivalent ("EPL 1.0") and deprecated
+    SPDX ids are rewritten in place. A `LicenseRef-` is not an SPDX list id,
+    so it goes in `license.name`: in `license.id` it fails schema validation.
+
+    Maven lists several licences on one POM to mean "any of these" (POM
+    reference, <licenses>), so a Maven component with more than one becomes a
+    single `A OR B` expression instead of an array a reader could take as AND.
+
+    Returns how many licences were added or rewritten.
     """
     lics = comp.get("licenses") or []
-    if not lics:
+    if not lics or any("expression" in l for l in lics):
         return 0
-    have_spdx = set()
+    changed = 0
     for l in lics:
         node = l.get("license") or {}
-        if isinstance(node, dict) and node.get("id"):
-            have_spdx.add(node["id"])
-    added = 0
+        if not isinstance(node, dict):
+            continue
+        if node.get("id") in DEPRECATED_SPDX:
+            node["id"] = DEPRECATED_SPDX[node["id"]]
+            changed += 1
+        elif node.get("name") in NAME_TO_SPDX:
+            node["id"] = NAME_TO_SPDX[node.pop("name")]
+            node.setdefault("acknowledgement", "declared")
+            changed += 1
+
+    # Anything that resolved to a WITH expression cannot stay in license.id.
+    terms = []
+    for l in lics:
+        node = l.get("license") or {}
+        terms.append(str(node.get("id") or "") if isinstance(node, dict) else "")
+    is_maven = str(parse_purl(comp.get("purl")).get("type") or "") == "maven"
+    if all(terms) and (any(" " in t for t in terms) or (is_maven and len(terms) > 1)):
+        expr = " OR ".join(("(" + t + ")") if (" " in t and len(terms) > 1) else t
+                           for t in dict.fromkeys(terms))
+        comp["licenses"] = [{"expression": expr, "acknowledgement": "declared"}]
+        return changed + 1
+
+    have = set()
+    for l in lics:
+        node = l.get("license") or {}
+        if isinstance(node, dict):
+            have.add(node.get("id") or node.get("name"))
     for l in list(lics):
         node = l.get("license") or {}
         if not isinstance(node, dict) or node.get("id") or not node.get("name"):
@@ -439,12 +515,19 @@ def normalise_component_licenses(comp: dict) -> int:
             if not chunk.startswith("License ::"):
                 continue
             spdx = CLASSIFIER_TO_SPDX.get(chunk)
-            if spdx and spdx not in have_spdx:
-                lics.append({"license": {"id": spdx,
+            # A vague classifier adds nothing when the package already names
+            # an exact SPDX id (idna: BSD-3-Clause in its LICENSE file).
+            if spdx and spdx.startswith("LicenseRef-PyPI-") and any(
+                    h and not str(h).startswith(("License ::", "LicenseRef-"))
+                    for h in have):
+                continue
+            if spdx and spdx not in have:
+                key = "name" if spdx.startswith("LicenseRef-") else "id"
+                lics.append({"license": {key: spdx,
                                          "acknowledgement": "concluded"}})
-                have_spdx.add(spdx)
-                added += 1
-    return added
+                have.add(spdx)
+                changed += 1
+    return changed
 
 
 def resolve_restrictions(comp: dict, table: dict) -> tuple:
@@ -615,10 +698,10 @@ def lookup_pkg_meta(comp: dict, cache: dict, offline: bool) -> dict:
                                + urllib.parse.quote(slug, safe=""))
                 if isinstance(pj, dict) and pj.get("description"):
                     out["description"] = str(pj["description"])[:500]
-            if repo and "supplier" not in out and not p.get("namespace"):
-                parts = re.sub(r"^https?://", "", str(repo)).strip("/").split("/")
-                if len(parts) >= 2:
-                    out["supplier"] = parts[1]
+            # No supplier from the source-repo URL: its path segment is an
+            # account name at best and "sponsors" (a GitHub Sponsors link) at
+            # worst. A missing supplier is reported as a gap; a guessed one
+            # reads as fact.
 
     cache[ck] = out
     return out
@@ -645,10 +728,12 @@ def derive_file_props(comp: dict) -> tuple:
     blob = (str(comp.get("name") or "") + " " + str(comp.get("purl") or "")).lower()
     ctype = str(comp.get("type") or "").lower()
     ptype = str(parse_purl(comp.get("purl")).get("type") or "").lower()
+    ends = (str(comp.get("name") or "").lower(),
+            str(comp.get("purl") or "").split("?")[0].split("@")[0].lower())
 
     if ctype in ("application", "container", "operating-system", "device", "firmware"):
         executable = "yes"
-    elif any(e in blob for e in EXEC_EXT):
+    elif any(EXEC_RE.search(s) for s in ends):
         executable = "yes"
     elif ptype in ("golang", "cargo", "docker", "oci", "deb", "rpm", "apk"):
         executable = "yes"
@@ -727,10 +812,10 @@ def load_vulns(path: Any) -> tuple:
             cvss3 = v.get("cvssv3") or {}
             cvss2 = v.get("cvssv2") or {}
             score = cvss3.get("baseScore") or cvss2.get("score")
-            sev = str(v.get("severity") or "unknown").lower()
+            sev = norm_severity(v.get("severity"))
             ratings = []
             if score or sev != "unknown":
-                method = "CVSSv31" if cvss3 else ("CVSSv2" if cvss2 else "other")
+                method = "CVSSv3" if cvss3 else ("CVSSv2" if cvss2 else "other")
                 r = {"severity": sev, "method": method}
                 if score is not None:
                     r["score"] = score
@@ -926,72 +1011,250 @@ def scan_osv(components: list) -> tuple:
         if isinstance(d, dict):
             detail_cache[vid] = d
 
+    # One record per vulnerability, however many advisory databases describe
+    # it. OSV returns the same CVE as a GHSA and a PYSEC record for every
+    # Python finding, which doubled the Python count (59 records, 40 CVEs).
+    by_primary: dict = {}
     for comp in queried:
         got = ids_by_comp.get(id(comp))
         if not got:
             continue
         ref = comp.get("bom-ref") or comp.get("purl")
-        for vid in got:
-            d = detail_cache.get(vid) or {}
-            sev_label = "unknown"
-            score = None
-            computed = None
-            for sev in (d.get("severity") or []):
-                if sev.get("type", "").startswith("CVSS") and sev.get("score"):
-                    score = sev["score"]
-                    if computed is None:
-                        computed = cvss31_base_score(score)
-            db = d.get("database_specific") or {}
-            if db.get("severity"):
-                sev_label = str(db["severity"]).lower()
-            elif computed is not None:
-                # No label from the advisory database, but a CVSS vector is
-                # present - score it rather than reporting "unknown".
-                sev_label = severity_from_score(computed)
-            # Fixed versions. OSV also publishes GIT ranges, whose "fixed"
-            # value is a commit SHA - advising a user to "upgrade to >=
-            # 74ea7cf7a6a2..." is useless, so only ecosystem/semver ranges
-            # are taken, with a SHA-shaped fallback filter for safety.
-            fixed = set()
-            for aff in (d.get("affected") or []):
-                for rng in (aff.get("ranges") or []):
-                    if str(rng.get("type", "")).upper() == "GIT":
-                        continue
-                    for ev in (rng.get("events") or []):
-                        fv = str(ev.get("fixed") or "")
-                        if fv and not re.fullmatch(r"[0-9a-f]{7,40}", fv):
-                            fixed.add(fv)
-            # CERT-In field 8 asks for "CVE identifiers". OSV returns its own
-            # id (GHSA-/PYSEC-) and carries the CVE as an alias, so without
-            # this the SBOM contains zero CVE numbers - which is what an
-            # assessor looks for first.
-            aliases = [str(a) for a in (d.get("aliases") or [])]
-            cves = [a for a in aliases if a.startswith("CVE-")]
-            rating: dict = {"method": "CVSSv31" if str(score or "").startswith("CVSS:3")
-                            else "other", "severity": sev_label}
-            if score:
-                rating["vector"] = score
-            if computed is not None:
-                rating["score"] = computed
-            rec = {
-                "id": vid,
-                "source": {"name": "OSV", "url": "https://osv.dev/vulnerability/" + vid},
-                "description": str(d.get("summary") or d.get("details") or "")[:1000],
-                "ratings": [rating] if (sev_label != "unknown" or score) else [],
-                "affects": [{"ref": ref}],
-                "_fixVersions": sorted(fixed),
-                "_cves": cves,
-            }
-            if cves:
-                rec["references"] = [
-                    {"id": c, "source": {"name": "NVD",
-                                         "url": "https://nvd.nist.gov/vuln/detail/" + c}}
-                    for c in cves]
-            vulns.append(rec)
+        for group in group_aliases(got, detail_cache):
+            primary = pick_primary(group)
+            d = detail_cache.get(primary) or {}
+            rec = by_primary.get(primary)
+            if rec is None:
+                # CERT-In field 8 asks for "CVE identifiers". OSV returns its
+                # own id (GHSA-/PYSEC-) and carries the CVE as an alias.
+                cves = sorted({str(a) for g in group
+                               for a in ((detail_cache.get(g) or {}).get("aliases") or [])
+                               if str(a).startswith("CVE-")})
+                ratings = osv_ratings(d)
+                if not ratings:
+                    for g in group:
+                        ratings = osv_ratings(detail_cache.get(g) or {})
+                        if ratings:
+                            break
+                rec = {
+                    "id": primary,
+                    "source": {"name": "OSV",
+                               "url": "https://osv.dev/vulnerability/" + primary},
+                    "description": str(d.get("summary") or d.get("details") or "")[:1000],
+                    "ratings": ratings,
+                    "affects": [],
+                    "_fixByRef": {},
+                    "_cves": cves,
+                }
+                refs = [{"id": c, "source": {"name": "NVD",
+                                             "url": "https://nvd.nist.gov/vuln/detail/" + c}}
+                        for c in cves]
+                refs += [{"id": g, "source": {"name": "OSV",
+                                              "url": "https://osv.dev/vulnerability/" + g}}
+                         for g in group if g != primary]
+                if refs:
+                    rec["references"] = refs
+                by_primary[primary] = rec
+                vulns.append(rec)
+            if ref and all(a.get("ref") != ref for a in rec["affects"]):
+                rec["affects"].append({"ref": ref})
+            # Twins should agree on the fix; where they do not, the higher
+            # one is the one that closes the vulnerability for both.
+            fixes = [f for f in (fix_for(detail_cache.get(g) or {}, comp)
+                                 for g in group) if f]
+            if fixes:
+                rec["_fixByRef"][ref] = max(fixes, key=version_key)
             for k in comp_keys(comp):
-                index.setdefault(k, []).append(rec)
+                if rec not in index.setdefault(k, []):
+                    index[k].append(rec)
 
     return index, vulns, unscannable
+
+
+def version_key(v: Any) -> tuple:
+    """Ordering for release numbers across PyPI, npm and Maven.
+
+    Plain string comparison put 9.0.121 above 11.0.25 and 3.7 above 3.15,
+    which is how a downgrade got recommended as a fix. Numbers compare as
+    numbers; pre-release words (rc, beta, SNAPSHOT) sort before the release;
+    release words (Final, GA) are ignored.
+    """
+    pre = {"dev": 0, "snapshot": 1, "a": 2, "alpha": 2, "b": 3, "beta": 3,
+           "m": 4, "milestone": 4, "pre": 5, "preview": 5, "c": 6, "rc": 6, "cr": 6}
+    out: list = []
+    for tok in re.findall(r"\d+|[A-Za-z]+", str(v or "")):
+        low = tok.lower()
+        if tok.isdigit():
+            out.append((2, int(tok), ""))
+        elif low in ("final", "ga", "release", "r"):
+            continue
+        elif low in pre:
+            out.append((0, pre[low], ""))
+        else:
+            out.append((1, 0, low))
+    out.append((1, 0, ""))
+    return tuple(out)
+
+
+OSV_ECOSYSTEM = {"pypi": "pypi", "npm": "npm", "maven": "maven", "golang": "go",
+                 "cargo": "crates.io", "nuget": "nuget", "gem": "rubygems",
+                 "composer": "packagist"}
+
+
+def osv_name(p: dict) -> str:
+    """The package name as OSV writes it for this purl."""
+    ptype = str(p.get("type") or "").lower()
+    name, ns = str(p.get("name") or ""), p.get("namespace")
+    if ptype == "maven" and ns:
+        return (str(ns) + ":" + name).lower()
+    if ptype == "pypi":
+        return norm_pyname(name)
+    return ((str(ns) + "/" + name) if ns else name).lower()
+
+
+def fix_for(d: dict, comp: dict) -> Any:
+    """Smallest version that fixes advisory `d` for THIS component's version.
+
+    Only the `affected` entry for the component's own package counts, and
+    only the range containing the installed version. An advisory covering
+    Tomcat 9, 10 and 11 lists a fix per branch; taking the largest string
+    across all of them told an 11.0.22 user to "upgrade to >= 9.0.121".
+    GIT ranges (whose "fixed" is a commit SHA) are skipped.
+    Returns None when no published fix applies.
+    """
+    p = parse_purl(comp.get("purl"))
+    inst = p.get("version")
+    if not inst:
+        return None
+    ik = version_key(inst)
+    eco = OSV_ECOSYSTEM.get(str(p.get("type") or "").lower())
+    want = osv_name(p)
+    in_range: list = []
+    later: list = []
+    for aff in (d.get("affected") or []):
+        pkg = aff.get("package") or {}
+        if eco and str(pkg.get("ecosystem", "")).lower().split(":")[0] != eco:
+            continue
+        pname = str(pkg.get("name") or "")
+        pname = norm_pyname(pname) if eco == "pypi" else pname.lower()
+        if pname != want:
+            continue
+        for rng in (aff.get("ranges") or []):
+            if str(rng.get("type", "")).upper() == "GIT":
+                continue
+            intro = None
+            spans = []
+            for ev in (rng.get("events") or []):
+                if "introduced" in ev:
+                    intro = str(ev["introduced"])
+                elif "fixed" in ev:
+                    spans.append((intro, str(ev["fixed"])))
+                    intro = None
+                elif "last_affected" in ev:
+                    spans.append((intro, None))
+                    intro = None
+            if intro is not None:
+                spans.append((intro, None))
+            for lo, fixed in spans:
+                if fixed and re.fullmatch(r"[0-9a-f]{7,40}", fixed):
+                    continue
+                if fixed and version_key(fixed) > ik:
+                    later.append(fixed)
+                lo_ok = lo in (None, "0") or version_key(lo) <= ik
+                if lo_ok and (fixed is None or ik < version_key(fixed)):
+                    if fixed:
+                        in_range.append(fixed)
+    if in_range:
+        return min(in_range, key=version_key)
+    # The installed version sits in no listed range (OSV matched it some other
+    # way, e.g. an explicit `versions` list): nearest fix above it.
+    return min(later, key=version_key) if later else None
+
+
+def group_aliases(ids: list, details: dict) -> list:
+    """Split advisory ids into groups that describe the same vulnerability."""
+    groups: list = []
+    for vid in ids:
+        names = {vid} | {str(a) for a in ((details.get(vid) or {}).get("aliases") or [])}
+        hit = [g for g in groups if g["names"] & names]
+        merged = {"ids": [vid], "names": names}
+        for g in hit:
+            merged["ids"] = g["ids"] + merged["ids"]
+            merged["names"] |= g["names"]
+            groups.remove(g)
+        groups.append(merged)
+    return [list(dict.fromkeys(g["ids"])) for g in groups]
+
+
+def pick_primary(group: list) -> str:
+    """GitHub advisories carry a reviewed severity label; prefer them."""
+    for prefix in ("GHSA-", "CVE-"):
+        for g in group:
+            if g.startswith(prefix):
+                return g
+    return sorted(group)[0]
+
+
+def norm_severity(label: Any) -> str:
+    s = str(label or "").lower()
+    if s == "moderate":
+        return "medium"
+    return s if s in ("critical", "high", "medium", "low", "info", "none") else "unknown"
+
+
+def osv_ratings(d: dict) -> list:
+    """CycloneDX ratings for one OSV record, one per source of severity.
+
+    Each CVSS vector gets its own rating with its own method. A score is only
+    given where it was computed FROM that vector (v3.x); a v4 vector is
+    recorded without a score rather than paired with the v3 one. The advisory
+    database's own label, when there is one, comes first and is what the
+    report shows.
+    """
+    out: list = []
+    db = norm_severity((d.get("database_specific") or {}).get("severity"))
+    if db != "unknown":
+        src = "GitHub Advisory Database" if str(d.get("id", "")).startswith("GHSA-") \
+            else "OSV"
+        out.append({"source": {"name": src}, "severity": db, "method": "other"})
+    for sev in (d.get("severity") or []):
+        vec = str(sev.get("score") or "")
+        if vec.startswith("CVSS:3"):
+            score = cvss31_base_score(vec)
+            r = {"method": "CVSSv31" if vec.startswith("CVSS:3.1") else "CVSSv3",
+                 "vector": vec}
+            if score is not None:
+                r["score"] = score
+                r["severity"] = severity_from_score(score)
+            out.append(r)
+        elif vec.startswith("CVSS:4"):
+            out.append({"method": "CVSSv4", "vector": vec})
+        elif str(sev.get("type", "")) == "CVSS_V2" and vec:
+            out.append({"method": "CVSSv2", "vector": vec})
+    return out
+
+
+def headline_severity(v: dict) -> str:
+    """The first rating that carries a severity: the database label if any."""
+    for r in (v.get("ratings") or []):
+        s = norm_severity(r.get("severity"))
+        if s != "unknown":
+            return s
+    return "unknown"
+
+
+def component_fixes(comp: dict, hits: list) -> list:
+    """One fix version per advisory that has one, for this component."""
+    keys = set(comp_keys(comp))
+    out = []
+    for h in hits:
+        byref = h.get("_fixByRef") or {}
+        f = next((byref[k] for k in byref if k in keys), None)
+        if f is None and h.get("_fixVersions"):
+            f = max(h["_fixVersions"], key=version_key)
+        if f:
+            out.append(f)
+    return out
 
 
 def patch_status_for(comp: dict, vuln_index: dict, scanned: bool = True) -> str:
@@ -1002,21 +1265,25 @@ def patch_status_for(comp: dict, vuln_index: dict, scanned: bool = True) -> str:
         if not scanned:
             return ("NOT ASSESSED - no vulnerability scan supplied "
                     "(pass --vulns or --scan-osv)")
-        return "up to date; no known vulnerabilities at SBOM timestamp"
+        # Only vulnerabilities were checked, not whether a newer release
+        # exists, so "up to date" would claim more than was looked at.
+        return ("no known vulnerabilities at scan time "
+                "(newer releases not checked)")
     seen = {}
     for h in hits:
         seen[h.get("id") or id(h)] = h
     hits = list(seen.values())
-    fixes = sorted({fv for h in hits for fv in (h.get("_fixVersions") or []) if fv})
-    worst = 0
-    for h in hits:
-        for r in (h.get("ratings") or []):
-            worst = max(worst, SEV_ORDER.get(str(r.get("severity") or "").lower(), 0))
+    fixes = component_fixes(comp, hits)
+    worst = max((SEV_ORDER.get(headline_severity(h), 0) for h in hits), default=0)
     label = SEV_LABEL.get(worst, "unknown")
     n = len(hits)
+    if fixes and len(fixes) == n:
+        return ("patch available (upgrade to >= " + max(fixes, key=version_key)
+                + "); " + str(n) + " known issue(s), max severity " + label)
     if fixes:
-        return ("patch available (upgrade to >= " + fixes[-1] + "); "
-                + str(n) + " known issue(s), max severity " + label)
+        return ("partial patch (upgrade to >= " + max(fixes, key=version_key)
+                + " fixes " + str(len(fixes)) + " of " + str(n)
+                + "); max severity " + label)
     return ("patch pending; no fixed version published; " + str(n)
             + " known issue(s), max severity " + label)
 
@@ -1063,7 +1330,7 @@ def field_present(field: str, comp: dict, bom: dict, dep_refs: set) -> bool:
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Enrich a CycloneDX SBOM to CERT-In SBOM Guidelines v1.0 s4.2")
+        description="Enrich a CycloneDX SBOM to CERT-In SBOM Guidelines s4.2")
     ap.add_argument("-i", "--input", required=True)
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("-m", "--metadata", help="curated metadata YAML/JSON")
@@ -1127,10 +1394,25 @@ def main() -> int:
     unscannable: list = []
     scan_source = os.path.basename(str(args.vulns)) if args.vulns else None
 
-    # ---- BOM-level fields: author, timestamp, supplier -------------------
+    # ---- BOM-level fields: identity, author, timestamp, supplier ---------
+    # The enriched SBOM is a different document from its input (vulnerabilities,
+    # thousands of properties, rewritten licences), so it gets its own serial
+    # and timestamp. Sharing them made consumers that key on serial+version
+    # treat the two as one. The input's serial is kept for traceability.
     md = bom.setdefault("metadata", {})
-    if not md.get("timestamp"):
-        md["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    md.setdefault("properties", [])
+    if bom.get("serialNumber"):
+        md["properties"].append({"name": "certin:derivedFromSerial",
+                                 "value": str(bom["serialNumber"])})
+    bom["serialNumber"] = "urn:uuid:" + str(uuid.uuid4())
+    bom["version"] = 1
+    md["timestamp"] = now
+    tools = md.setdefault("tools", {"components": []})
+    if isinstance(tools, dict):
+        tools.setdefault("components", []).append(
+            {"type": "application", "name": "certin_enrich.py",
+             "version": TOOL_VERSION})
     if not md.get("authors"):
         author = (project.get("sbomAuthor")
                   or os.environ.get("GITHUB_REPOSITORY")
@@ -1139,10 +1421,8 @@ def main() -> int:
             md["authors"] = [{"name": str(author)}]
     if not md.get("supplier") and project.get("organization"):
         md["supplier"] = {"name": str(project["organization"])}
-    md.setdefault("properties", [])
     bom_props = [
-        ("certin:guidelineVersion",
-         "CERT-In Technical Guidelines on SBOM v1.0 (03.10.2024)"),
+        ("certin:guidelineVersion", GUIDELINE),
         ("certin:sbomLevel", project.get("sbomLevel", "Complete SBOM")),
         ("certin:sbomClassification", project.get("sbomClassification", "Build SBOM")),
     ]
@@ -1216,6 +1496,8 @@ def main() -> int:
                    for p in md["properties"]):
             md["properties"].append({"name": "certin:vulnScanSource",
                                      "value": scan_source})
+            md["properties"].append({"name": "certin:vulnScanTime",
+                                     "value": now})
         if unscannable:
             md["properties"].append(
                 {"name": "certin:unscannableComponents",
@@ -1259,13 +1541,21 @@ def main() -> int:
                     set_prop(comp, "hashSource", "npm lockfile integrity")
                     break
 
-        # supplier: generator -> curated -> PURL namespace -> registry owner
-        if not ((comp.get("supplier") or {}).get("name") or comp.get("publisher")):
-            sup = (entry.get("supplier")
-                   or parse_purl(comp.get("purl")).get("namespace")
-                   or online.get("supplier"))
+        # supplier: generator -> curated -> registry-declared author.
+        # A Maven groupId is a namespace, not an organisation, so it is never
+        # used ("org.apache.tomcat.embed" is not a supplier). Where the value
+        # came from is recorded, because the report attributes field 4 to the
+        # generator and 59 of 146 were not.
+        if (comp.get("supplier") or {}).get("name") or comp.get("publisher"):
+            set_prop(comp, "supplierSource", "generator")
+        else:
+            if entry.get("supplier"):
+                sup, src = entry["supplier"], "curated metadata"
+            else:
+                sup, src = online.get("supplier"), "package registry author field"
             if sup:
                 comp["supplier"] = {"name": str(sup)}
+                set_prop(comp, "supplierSource", src)
 
         # description: generator -> curated -> registry
         if not comp.get("description"):
@@ -1312,10 +1602,17 @@ def main() -> int:
                  or patch_status_for(comp, vuln_index, scanned=scan_ran),
                  overwrite=True)
 
-        # criticality
-        set_prop(comp, "criticality",
-                 entry.get("criticality")
-                 or derive_criticality(comp, direct, vuln_index))
+        # criticality. sbom-metadata.yml calls this human judgement; where no
+        # human has ruled, the derived value says so rather than passing as one.
+        if entry.get("criticality"):
+            set_prop(comp, "criticality", entry["criticality"])
+            set_prop(comp, "criticalitySource", "curated metadata")
+        else:
+            set_prop(comp, "criticality",
+                     derive_criticality(comp, direct, vuln_index))
+            set_prop(comp, "criticalitySource",
+                     "derived: vulnerable+direct=critical, vulnerable=high, "
+                     "direct=medium, else low; not yet reviewed")
 
         # file-nature properties
         ex, ar, st = derive_file_props(comp)
@@ -1326,8 +1623,9 @@ def main() -> int:
         set_prop(comp, "enrichedBy", "certin_enrich.py")
 
     if spdx_added:
-        log("resolved " + str(spdx_added) + " non-SPDX licence name(s) to SPDX "
-            "identifiers (recorded as concluded; original kept as declared)")
+        log("normalised " + str(spdx_added) + " licence entr(ies) to SPDX "
+            "(classifiers added as concluded; known names, deprecated ids and "
+            "Maven multi-licence lists rewritten)")
 
     # ---- attach vulnerabilities (VDR) ------------------------------------
     if cdx_vulns:
@@ -1369,14 +1667,23 @@ def main() -> int:
         lines = [
             "# CERT-In SBOM Compliance Report",
             "",
-            "Generated by `certin_enrich.py` against **CERT-In Technical Guidelines "
-            "on SBOM v1.0 (03.10.2024), section 4.2**.",
+            "Generated by `certin_enrich.py` against **" + GUIDELINE
+            + ", section 4.2** (the 21 fields are unchanged from v1.0).",
             "",
-            "- Input: `" + os.path.basename(args.input) + "`",
+            "- Input: `" + os.path.basename(args.input) + "`; the figures below "
+            "measure the enriched output `" + os.path.basename(args.output) + "`",
             "- Components analysed: **" + str(total) + "**",
-            "- Vulnerabilities recorded: **" + str(nvulns) + "**",
+            "- Vulnerabilities recorded: **" + str(nvulns) + "** ("
+            + str(len({c for v in cdx_vulns for c in (v.get("_cves") or [])}))
+            + " distinct CVE ids; advisories describing the same CVE are merged)",
             "- Overall field coverage: **" + ("%.1f" % overall) + "%**",
             "- SBOM timestamp: `" + str(md.get("timestamp")) + "`",
+        ]
+        if lic_table and not (lic_table.get("meta") or {}).get("reviewed"):
+            lines.append("- **Usage restrictions (field 13) are DRAFT**: the "
+                         "licence table has not been reviewed by Legal "
+                         "(`meta.reviewed: false`)")
+        lines += [
             "",
             "## Field coverage (21 mandated data fields)",
             "",
@@ -1418,22 +1725,21 @@ def main() -> int:
                     if k:
                         label_for[k] = lbl
             grouped: dict = {}
+            comp_for: dict = {}
+            for c in components:
+                for k in comp_keys(c):
+                    comp_for.setdefault(k, c)
             for v in vulns:
                 for aff in (v.get("affects") or []):
                     key = label_for.get(aff.get("ref"), str(aff.get("ref")))
                     grouped.setdefault(key, []).append(v)
+                    comp_for.setdefault(key, comp_for.get(aff.get("ref"), {}))
 
             def worst_of(vs):
-                return max((sev_rank.get(str(r.get("severity", "")).lower(), 0)
-                            for x in vs for r in (x.get("ratings") or [])),
+                return max((sev_rank.get(headline_severity(x), 0) for x in vs),
                            default=0)
 
-            def sev_of(v):
-                r = (v.get("ratings") or [{}])[0]
-                lab = str(r.get("severity", "unknown")).lower()
-                # GitHub says "moderate" where CVSS says "medium"; one band,
-                # one name, or the tally double-counts it.
-                return "medium" if lab == "moderate" else lab
+            sev_of = headline_severity
 
             counts: dict = {}
             for v in vulns:
@@ -1448,7 +1754,7 @@ def main() -> int:
                       + " of " + str(total) + " components** — " + tally + ".",
                       "",
                       "Scanned against " + str(scan_source or "no source")
-                      + " at the SBOM timestamp above. An advisory match means a "
+                      + " at " + now + ". An advisory match means a "
                       "version range matches; it does not confirm the vulnerable "
                       "code is reachable in this product.",
                       "",
@@ -1460,13 +1766,19 @@ def main() -> int:
                 vs = grouped[comp_label]
                 sev = {4: "critical", 3: "high", 2: "medium",
                        1: "low"}.get(worst_of(vs), "unrated")
-                fixes = sorted({f for x in vs for f in (x.get("_fixVersions") or [])})
-                fix = ("upgrade to >= " + fixes[-1]) if fixes else "none published"
+                fixes = component_fixes(comp_for.get(comp_label) or {}, vs)
+                if not fixes:
+                    fix = "none published"
+                else:
+                    fix = "upgrade to >= " + max(fixes, key=version_key)
+                    if len(fixes) < len(vs):
+                        fix += " (fixes " + str(len(fixes)) + " of " + str(len(vs)) + ")"
                 ids = []
                 for x in vs:
                     cves = x.get("_cves") or []
                     ids.extend(cves if cves else [str(x.get("id"))])
-                shown = ", ".join(dict.fromkeys(ids[:3]))
+                ids = list(dict.fromkeys(ids))
+                shown = ", ".join(ids[:3])
                 if len(ids) > 3:
                     shown += " +" + str(len(ids) - 3)
                 lines.append("| " + sev + " | `" + comp_label + "` | "
