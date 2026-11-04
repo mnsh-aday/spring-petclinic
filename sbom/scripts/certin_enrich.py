@@ -3,8 +3,8 @@
 certin_enrich.py -- turn a generic CycloneDX SBOM into a CERT-In compliant one.
 
 CERT-In "Technical Guidelines on SBOM" section 4.2 mandates 21 data fields per
-component (v1.0, 03.10.2024; unchanged in v2.0, 09.07.2025). Standard generators (Syft, cdxgen, cyclonedx-*) emit
-roughly half. This script fills the rest from three sources, in priority order:
+component (v1.0, 03.10.2024; unchanged in v2.0, 09.07.2025). Standard
+generators (Syft, cdxgen, cyclonedx-*) emit roughly half. This script fills the rest from three sources, in priority order:
 
   1. What the generator already produced        (never overwritten)
   2. Curated metadata file                      (human-owned judgement fields)
@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -76,15 +77,24 @@ EXEC_EXT = (".exe", ".sh", ".bat", ".cmd", ".bin", ".ps1", ".dll", ".so", ".dyli
 EXEC_RE = re.compile(r"(?:" + "|".join(re.escape(e) for e in EXEC_EXT) + r")$")
 
 # PURL name fragment -> endoflife.date product slug. High-confidence only.
+# Keyed by (purl type, package name), or by namespace for product families
+# whose artefacts all carry the product's version. Only packages whose own
+# version IS the product's version: the "postgresql" Maven artefact is the
+# JDBC driver (42.x), not PostgreSQL 42, and PyPI "redis" is a client
+# library, so server products are deliberately absent.
 EOL_SLUGS = {
-    "tomcat": "tomcat", "postgresql": "postgresql", "mysql": "mysql",
-    "nginx": "nginx", "redis": "redis", "mongodb": "mongodb",
-    "spring-boot": "spring-boot", "spring-framework": "spring-framework",
-    "django": "django", "flask": "flask", "rails": "rails", "laravel": "laravel",
-    "nodejs": "nodejs", "python": "python", "openjdk": "java",
-    "kubernetes": "kubernetes", "elasticsearch": "elasticsearch",
-    "rabbitmq": "rabbitmq", "kafka": "apache-kafka", "angular": "angular",
-    "react": "react", "vue": "vue", "log4j": "log4j",
+    ("maven", "spring-boot"): "spring-boot",
+    ("pypi", "django"): "django", ("pypi", "flask"): "flask",
+    ("gem", "rails"): "rails",
+    ("npm", "react"): "react", ("npm", "vue"): "vue",
+}
+EOL_NAMESPACES = {
+    "org.apache.tomcat.embed": "tomcat", "org.apache.tomcat": "tomcat",
+    "org.springframework.boot": "spring-boot",
+    "org.springframework": "spring-framework",
+    "org.apache.logging.log4j": "log4j",
+    "org.apache.kafka": "apache-kafka",
+    "@angular": "angular",
 }
 
 # PURL type -> deps.dev system name
@@ -161,15 +171,34 @@ def log(msg: str) -> None:
     print("[certin] " + msg, file=sys.stderr)
 
 
-def http_json(url: str) -> Any:
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "certin-enrich/1.0",
-                          "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
+def http_json(url: str, payload: Any = None, tries: int = 1,
+              timeout: int = HTTP_TIMEOUT) -> Any:
+    """GET (or POST `payload`) and parse JSON; None after `tries` failures."""
+    headers = {"User-Agent": "certin-enrich/1.0", "Accept": "application/json"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception as e:
+            if attempt + 1 < tries:
+                time.sleep(2 * (attempt + 1))
+            elif tries > 1:
+                log("WARNING " + url + " failed after " + str(tries)
+                    + " tries: " + str(e))
+    return None
+
+
+class ScanIncomplete(Exception):
+    """OSV could not be asked about every component.
+
+    Raised instead of carrying on, because a component nobody asked about
+    would otherwise be reported as having no known vulnerabilities.
+    """
 
 
 def parse_purl(purl: Any) -> dict:
@@ -219,6 +248,21 @@ def set_prop(comp: dict, key: str, value: Any, overwrite: bool = False) -> None:
                 p["value"] = str(value)
             return
     props.append({"name": name, "value": str(value)})
+
+
+def vuln_keys(comp: dict) -> list:
+    """Identifiers that name exactly one component version (for findings)."""
+    keys = []
+    if comp.get("bom-ref"):
+        keys.append(str(comp["bom-ref"]))
+    purl = comp.get("purl")
+    if purl:
+        keys.append(purl)
+        # Qualifiers stay when they distinguish a file (classifier).
+        base, _, quals = purl.split("#")[0].partition("?")
+        cls = [q for q in quals.split("&") if q.startswith("classifier=")]
+        keys.append(base + ("?" + cls[0] if cls else ""))
+    return list(dict.fromkeys(keys))
 
 
 def comp_keys(comp: dict) -> list:
@@ -421,6 +465,10 @@ def license_ids(comp: dict) -> list:
                 elif node.get("name"):
                     raw_values.append(str(node["name"]))
         for raw in raw_values:
+            # Known free-text names first: some contain commas ("The GNU
+            # General Public License, v2 with Universal FOSS Exception, v1.0")
+            # and would otherwise be cut apart by the classifier-list split.
+            raw = NAME_TO_SPDX.get(raw.strip(), raw)
             # comma-separated classifier lists first, then SPDX operators
             for chunk in raw.split(","):
                 chunk = chunk.strip()
@@ -499,6 +547,13 @@ def normalise_component_licenses(comp: dict) -> int:
                            for t in dict.fromkeys(terms))
         comp["licenses"] = [{"expression": expr, "acknowledgement": "declared"}]
         return changed + 1
+    # Mixed with an unmapped free-text licence, an expression is not
+    # possible (CycloneDX allows one expression OR a list of licences), and an
+    # expression is not a valid license.id. Keep it, readably, as the name.
+    for l in lics:
+        node = l.get("license") or {}
+        if isinstance(node, dict) and " " in str(node.get("id") or ""):
+            node["name"] = node.pop("id")
 
     have = set()
     for l in lics:
@@ -582,20 +637,22 @@ def resolve_restrictions(comp: dict, table: dict) -> tuple:
 def lookup_eol(comp: dict, cache: dict, offline: bool) -> Any:
     if offline:
         return None
-    name = str(comp.get("name") or "").lower()
-    if not name:
-        return None
-    slug = EOL_SLUGS.get(name)
-    if not slug:
-        for k, v in EOL_SLUGS.items():
-            if k in name:
-                slug = v
-                break
+    # Exact package or product namespace only. Substring matching gave
+    # redis-py the Redis SERVER's EOL date and vue-router Vue's.
+    p = parse_purl(comp.get("purl"))
+    ptype = str(p.get("type") or "").lower()
+    ns = str(p.get("namespace") or "").lower()
+    name = str(p.get("name") or "").lower()
+    slug = (EOL_NAMESPACES.get(ns) if ns else None) or EOL_SLUGS.get((ptype, name))
     if not slug:
         return None
     if slug not in cache:
-        cache[slug] = http_json("https://endoflife.date/api/" + slug + ".json") or []
+        cache[slug] = http_json("https://endoflife.date/api/" + slug + ".json", tries=2)
     cycles = cache[slug]
+    if cycles is None:
+        # Not "not published by supplier": the supplier does publish it, we
+        # just could not reach the source.
+        return "unknown (endoflife.date unreachable)"
     if not isinstance(cycles, list):
         return None
     ver = str(comp.get("version") or "")
@@ -750,7 +807,7 @@ def derive_file_props(comp: dict) -> tuple:
 
 
 def derive_criticality(comp: dict, direct: set, vuln_index: dict) -> str:
-    keys = comp_keys(comp)
+    keys = vuln_keys(comp)
     has_vuln = any(vuln_index.get(k) for k in keys)
     is_direct = any(k in direct for k in keys)
     if has_vuln and is_direct:
@@ -786,6 +843,10 @@ def load_vulns(path: Any) -> tuple:
     # --- CycloneDX VDR / VEX shape ---
     if isinstance(data, dict) and data.get("bomFormat") == "CycloneDX":
         for v in (data.get("vulnerabilities") or []):
+            # Same rule as for OSV: "moderate" is not a CycloneDX severity.
+            for r in (v.get("ratings") or []):
+                if "severity" in r:
+                    r["severity"] = norm_severity(r["severity"])
             cdx_vulns.append(v)
             for aff in (v.get("affects") or []):
                 ref = aff.get("ref")
@@ -820,25 +881,197 @@ def load_vulns(path: Any) -> tuple:
                 if score is not None:
                     r["score"] = score
                 ratings.append(r)
-            fixes = set()
+            # Each vulnerable range is kept whole; the fix is chosen per
+            # component in attach_to_components, from the range holding the
+            # installed version. Taking the largest end across ranges sent a
+            # Tomcat 9.0.50 user to 11.0.0-M21.
+            # A CVE's configurations can list other vendors' products, each
+            # with its own end version; only the product Dependency-Check
+            # matched (vulnerabilityIdMatched) describes this dependency.
+            ranges = []
             for sw in (v.get("vulnerableSoftware") or []):
-                if not isinstance(sw, dict):
-                    continue
-                fv = sw.get("versionEndExcluding") or sw.get("versionEndIncluding")
-                if fv:
-                    fixes.add(str(fv))
+                if isinstance(sw, dict):
+                    sw = sw.get("software", sw)
+                if isinstance(sw, dict):
+                    r = {k: str(sw[k]) for k in (
+                        "versionStartIncluding", "versionStartExcluding",
+                        "versionEndExcluding", "versionEndIncluding") if sw.get(k)}
+                    cpe = str(sw.get("id") or "").split(":")
+                    r["_product"] = ":".join(cpe[3:5]) if len(cpe) > 4 else ""
+                    r["_matched"] = str(sw.get("vulnerabilityIdMatched")).lower() == "true"
+                    ranges.append(r)
+            matched = {r["_product"] for r in ranges if r["_matched"] and r["_product"]}
+            if not matched:
+                # Older reports carry no vulnerabilityIdMatched flag: fall back
+                # to CPE products named like the dependency's own package.
+                pkg_names = {str(parse_purl(x).get("name") or "").lower() for x in refs}
+                pkg_names.discard("")
+                matched = {r["_product"] for r in ranges
+                           if r["_product"].split(":")[-1].lower() in pkg_names}
+            if matched:
+                ranges = [r for r in ranges if r["_product"] in matched]
             cdxv = {
                 "id": v.get("name"),
                 "source": {"name": v.get("source") or "NVD"},
                 "description": str(v.get("description") or "")[:2000],
                 "ratings": ratings,
                 "affects": [{"ref": r} for r in refs],
-                "_fixVersions": sorted(fixes),
+                "_dcRanges": ranges,
             }
             cdx_vulns.append(cdxv)
             for r in refs:
                 index.setdefault(r, []).append(cdxv)
     return index, cdx_vulns
+
+
+# VEX analysis states meaning "this finding does not apply (any more)".
+NOT_COUNTED = {"not_affected", "false_positive", "resolved", "resolved_with_pedigree"}
+
+
+def comp_vkey(comp: dict):
+    """Version ordering for this component's ecosystem (SemVer for npm/Go/Cargo)."""
+    ptype = str(parse_purl(comp.get("purl")).get("type") or "").lower()
+    sv = OSV_ECOSYSTEM.get(ptype) in SEMVER_ECOSYSTEMS
+    return lambda x: version_key(x, semver=sv)
+
+
+def dc_fix(ranges: list, version: Any, vk: Any = None) -> Any:
+    """Fix for `version` from Dependency-Check ranges: the end of the range
+    that contains it. versionEndIncluding is the last AFFECTED version, so a
+    range ending that way has no fix of its own. `vk` is the ecosystem's
+    version ordering (comp_vkey)."""
+    if not version:
+        return None
+    vk = vk or version_key
+    ik = vk(version)
+    hits, later, unfixed = [], [], False
+    for r in ranges:
+        lo_ok = True
+        if r.get("versionStartIncluding"):
+            lo_ok = vk(r["versionStartIncluding"]) <= ik
+        elif r.get("versionStartExcluding"):
+            lo_ok = vk(r["versionStartExcluding"]) < ik
+        end = r.get("versionEndExcluding")
+        if end and vk(end) > ik:
+            later.append(end)
+        if not lo_ok:
+            continue
+        if end:
+            if ik < vk(end):
+                hits.append(end)
+        elif r.get("versionEndIncluding"):
+            if ik <= vk(r["versionEndIncluding"]):
+                unfixed = True
+        else:
+            unfixed = True
+    if hits:
+        return min(hits, key=vk)
+    if unfixed or any(r.get("versionStartIncluding") or r.get("versionStartExcluding")
+                      for r in ranges):
+        return None
+    return min(later, key=vk) if later else None
+
+
+def attach_to_components(vulns: list, components: list, root: Any = None) -> tuple:
+    """Point supplied findings at the SBOM's own components.
+
+    A Dependency-Check report names packages by purl, CPE or jar file name;
+    none of those is a bom-ref, so copied as-is every `affects` entry dangled.
+    Each ref is matched to the component (or the product root) whose bom-ref
+    or purl it is; anything else in the affects entry, such as a VEX
+    `versions` list, is kept. Refs that match nothing (CPEs, file names) are
+    dropped, and a finding that matches nothing at all is left out with a
+    warning rather than attached to a component it may not describe.
+
+    A finding stays in the document but is not counted against a component
+    when its VEX analysis says it does not apply (not_affected, ...) or its
+    affects entry marks that component's version unaffected.
+    -> (findings, index keyed by bom-ref)
+    """
+    by_key: dict = {}
+    by_ref: dict = {}
+    for c in list(components) + ([root] if isinstance(root, dict) else []):
+        if c.get("bom-ref"):
+            by_ref.setdefault(c["bom-ref"], c)
+            for k in vuln_keys(c):
+                by_key.setdefault(k, c["bom-ref"])
+    kept, index, unmatched = [], {}, 0
+    for v in vulns:
+        affects: dict = {}
+        for a in (v.get("affects") or []):
+            r = str(a.get("ref") or "")
+            target = by_key.get(r) or by_key.get(r.split("?")[0])
+            if not target:
+                continue
+            if target in affects:
+                vs = affects[target].get("versions") or []
+                for x in (a.get("versions") or []):
+                    if x not in vs:
+                        vs.append(x)
+                if vs:
+                    affects[target]["versions"] = vs
+            else:
+                affects[target] = dict(a, ref=target)
+        if not affects:
+            unmatched += 1
+            continue
+        v["affects"] = list(affects.values())
+        kept.append(v)
+        state = str((v.get("analysis") or {}).get("state") or "")
+        for ref, a in affects.items():
+            comp = by_ref.get(ref) or {}
+            if v.get("_dcRanges"):
+                f = dc_fix(v["_dcRanges"], comp.get("version"), comp_vkey(comp))
+                if f:
+                    v.setdefault("_fixByRef", {})[ref] = f
+            if state in NOT_COUNTED:
+                continue
+            if any(str(x.get("version")) == str(comp.get("version"))
+                   and x.get("status") == "unaffected"
+                   for x in (a.get("versions") or []) if isinstance(x, dict)):
+                continue
+            index.setdefault(ref, []).append(v)
+    if unmatched:
+        log("WARNING " + str(unmatched) + " supplied finding(s) matched no "
+            "component in the SBOM by bom-ref or purl and were left out")
+    return kept, index
+
+
+def finding_names(v: dict) -> set:
+    """Every identifier a finding goes by: its id, CVEs and listed twins."""
+    names = {str(v.get("id") or "")} | set(v.get("_cves") or [])
+    names |= {str(r.get("id")) for r in (v.get("references") or [])
+              if isinstance(r, dict) and r.get("id")}
+    names.discard("")
+    return names
+
+
+def suppress_by_vex(index: dict, vulns: list, components: list, root: Any) -> None:
+    """A VEX "not_affected" (etc.) for CVE-X on a component also stops OSV's
+    record for the same vulnerability (GHSA-..., alias CVE-X) being counted
+    against THAT component. Other components are unaffected. `vulns` are the
+    supplied (--vulns) findings, already attached to bom-refs."""
+    by_ref = {c.get("bom-ref"): c for c in list(components) + [root or {}]
+              if c.get("bom-ref")}
+    for v in vulns:
+        record_level = str((v.get("analysis") or {}).get("state") or "") in NOT_COUNTED
+        names = finding_names(v)
+        for a in (v.get("affects") or []):
+            comp = by_ref.get(a.get("ref"))
+            if not comp:
+                continue
+            # Same two forms attach_to_components honours: a record-level
+            # analysis state, or this component's version marked unaffected.
+            version_level = any(
+                str(x.get("version")) == str(comp.get("version"))
+                and x.get("status") == "unaffected"
+                for x in (a.get("versions") or []) if isinstance(x, dict))
+            if not (record_level or version_level):
+                continue
+            for k in vuln_keys(comp):
+                if k in index:
+                    index[k] = [x for x in index[k]
+                                if x is v or not (finding_names(x) & names)]
 
 
 def norm_pyname(n: Any) -> str:
@@ -949,6 +1182,25 @@ def severity_from_score(score: Any) -> str:
     return "none"
 
 
+def osv_more_pages(purl: Any, token: Any) -> list:
+    """Advisory ids from the remaining result pages of one OSV query."""
+    ids: list = []
+    pages = 0
+    while token:
+        pages += 1
+        if pages > 50:
+            raise ScanIncomplete("OSV kept paging for " + str(purl))
+        res = http_json("https://api.osv.dev/v1/querybatch",
+                        {"queries": [{"package": {"purl": purl}, "page_token": token}]},
+                        tries=3, timeout=60)
+        results = res.get("results") if isinstance(res, dict) else None
+        if not isinstance(results, list) or len(results) != 1:
+            raise ScanIncomplete("OSV paging failed for " + str(purl))
+        ids += [v.get("id") for v in ((results[0] or {}).get("vulns") or []) if v.get("id")]
+        token = (results[0] or {}).get("next_page_token")
+    return ids
+
+
 def scan_osv(components: list) -> tuple:
     """Query OSV.dev for every component and return CycloneDX vulnerabilities.
 
@@ -985,31 +1237,32 @@ def scan_osv(components: list) -> tuple:
     ids_by_comp: dict = {}
     BATCH = 500
     for i in range(0, len(queries), BATCH):
-        payload = {"queries": queries[i:i + BATCH]}
-        try:
-            req = urllib.request.Request(
-                "https://api.osv.dev/v1/querybatch",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json",
-                         "User-Agent": "certin-enrich/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                res = json.loads(r.read().decode())
-        except Exception as e:
-            log("WARNING OSV batch failed: " + str(e))
-            continue
-        for comp, entry in zip(queried[i:i + BATCH], res.get("results", [])):
-            got = [v.get("id") for v in (entry.get("vulns") or []) if v.get("id")]
+        chunk = queries[i:i + BATCH]
+        res = http_json("https://api.osv.dev/v1/querybatch", {"queries": chunk},
+                        tries=3, timeout=60)
+        results = res.get("results") if isinstance(res, dict) else None
+        if not isinstance(results, list) or len(results) != len(chunk):
+            raise ScanIncomplete("OSV querybatch failed for components "
+                                 + str(i + 1) + "-" + str(i + len(chunk)))
+        for comp, entry in zip(queried[i:i + BATCH], results):
+            got = [v.get("id") for v in ((entry or {}).get("vulns") or []) if v.get("id")]
+            # More advisories than one page holds: follow the pages, since a
+            # partial list would understate the component's exposure.
+            got += osv_more_pages(comp.get("purl"), (entry or {}).get("next_page_token"))
             if got:
-                ids_by_comp[id(comp)] = got
+                ids_by_comp[id(comp)] = list(dict.fromkeys(got))
 
     # fetch detail (severity, fixed version) once per unique advisory
     detail_cache: dict = {}
     all_ids = sorted({vid for ids in ids_by_comp.values() for vid in ids})
     log("resolving " + str(len(all_ids)) + " advisories")
     for vid in all_ids:
-        d = http_json("https://api.osv.dev/v1/vulns/" + urllib.parse.quote(vid))
-        if isinstance(d, dict):
-            detail_cache[vid] = d
+        d = http_json("https://api.osv.dev/v1/vulns/" + urllib.parse.quote(vid), tries=3)
+        if not isinstance(d, dict):
+            # Without the record there is no severity and no fix version;
+            # reporting "no fixed version published" would be invented.
+            raise ScanIncomplete("could not fetch OSV advisory " + vid)
+        detail_cache[vid] = d
 
     # One record per vulnerability, however many advisory databases describe
     # it. OSV returns the same CVE as a GHSA and a PYSEC record for every
@@ -1063,37 +1316,151 @@ def scan_osv(components: list) -> tuple:
             fixes = [f for f in (fix_for(detail_cache.get(g) or {}, comp)
                                  for g in group) if f]
             if fixes:
-                rec["_fixByRef"][ref] = max(fixes, key=version_key)
-            for k in comp_keys(comp):
-                if rec not in index.setdefault(k, []):
-                    index[k].append(rec)
+                rec["_fixByRef"][ref] = max(fixes, key=comp_vkey(comp))
+            # Indexed by this component's own identity only. comp_keys() also
+            # yields the bare name, which would pin semver@5.7.1's advisory on
+            # semver@7.6.0 in the same SBOM.
+            for k in vuln_keys(comp):
+                lst = index.setdefault(k, [])
+                if not any(x is rec for x in lst):
+                    lst.append(rec)
 
     return index, vulns, unscannable
 
 
-def version_key(v: Any) -> tuple:
-    """Ordering for release numbers across PyPI, npm and Maven.
+def version_key(v: Any, semver: bool = False) -> tuple:
+    """Ordering for release numbers across PyPI, npm, Maven and Go.
 
     Plain string comparison put 9.0.121 above 11.0.25 and 3.7 above 3.15,
     which is how a downgrade got recommended as a fix. Numbers compare as
     numbers; pre-release words (rc, beta, SNAPSHOT) sort before the release;
-    release words (Final, GA) are ignored.
+    release words (Final, GA) are ignored; a Go-style leading "v" is
+    dropped; trailing zeros do not count (2.0 == 2.0.0, and both are above
+    2.0.0-rc1).
+
+    semver=True (npm, Go, Cargo): everything after the first "-" is a
+    pre-release, so 1.0.0-0 < 1.0.0 and 2.0.0-1 < 2.0.0; build metadata
+    ("+...") is ignored. Maven/PyPI keep the default, where 2.0.0-1 is a
+    post-release above 2.0.0.
     """
     pre = {"dev": 0, "snapshot": 1, "a": 2, "alpha": 2, "b": 3, "beta": 3,
            "m": 4, "milestone": 4, "pre": 5, "preview": 5, "c": 6, "rc": 6, "cr": 6}
+    s = re.sub(r"^[vV](?=\d)", "", str(v or "").strip())
+    if semver:
+        main, _, prerel = s.split("+", 1)[0].partition("-")
+        k = version_key(main)[:-1]
+        if not prerel:
+            return k + ((1, 0, ""),)
+        # SemVer 11: dot-separated identifiers; numeric ones compare as
+        # numbers and below alphanumeric ones ("alpha1" is one identifier,
+        # "alpha.1" two); fewer identifiers sort lower when all else is equal.
+        tail = tuple((1, int(i), "") if i.isdigit() else (2, 0, i)
+                     for i in prerel.split("."))
+        return k + ((0, -1, ""),) + tail + ((0, 0, ""),)
     out: list = []
-    for tok in re.findall(r"\d+|[A-Za-z]+", str(v or "")):
+
+    def trim() -> None:
+        # Zeros at the end of a numeric run carry no ordering information.
+        while len(out) > 1 and out[-1] == (2, 0, "") and out[-2][0] == 2:
+            out.pop()
+
+    for tok in re.findall(r"\d+|[A-Za-z]+", s):
         low = tok.lower()
         if tok.isdigit():
             out.append((2, int(tok), ""))
-        elif low in ("final", "ga", "release", "r"):
             continue
-        elif low in pre:
-            out.append((0, pre[low], ""))
-        else:
-            out.append((1, 0, low))
+        if low in ("final", "ga", "release", "r"):
+            continue
+        trim()
+        out.append((0, pre[low], "") if low in pre else (1, 0, low))
+    trim()
     out.append((1, 0, ""))
     return tuple(out)
+
+
+# OSV ecosystems whose versions follow SemVer pre-release rules.
+SEMVER_ECOSYSTEMS = {"npm", "go", "crates.io"}
+
+
+def is_commit_hash(s: str) -> bool:
+    """A git SHA, as OSV gives for GIT ranges - not a release number.
+
+    Hex with at least one letter: an all-digit string of 7+ digits is a
+    date-style version (org.json 20231013), not a hash.
+    """
+    return bool(re.fullmatch(r"[0-9a-f]{7,40}", s)) and not s.isdigit()
+
+
+def fix_from_affected(affected: list, eco: Any, want: str, installed: str) -> Any:
+    """Smallest fix in OSV `affected` entries for package `want` at version `installed`.
+
+    Only the entry for that exact package counts, and only the range that
+    contains the installed version. An advisory covering Tomcat 9, 10 and 11
+    lists a fix per branch; taking the largest string across all of them told
+    an 11.0.22 user to "upgrade to >= 9.0.121". GIT ranges (whose "fixed" is
+    a commit SHA) are skipped. Returns None when no published fix applies.
+    """
+    sv = eco in SEMVER_ECOSYSTEMS
+    vk = lambda x: version_key(x, semver=sv)
+    ik = vk(installed)
+    in_range: list = []
+    later: list = []
+    unfixed = False
+    for aff in affected:
+        pkg = aff.get("package") or {}
+        if eco and str(pkg.get("ecosystem", "")).lower().split(":")[0] != eco:
+            continue
+        pname = str(pkg.get("name") or "")
+        pname = re.sub(r"[-_.]+", "-", pname).lower() if eco == "pypi" else pname.lower()
+        if pname != want:
+            continue
+        for rng in (aff.get("ranges") or []):
+            if str(rng.get("type", "")).upper() == "GIT":
+                continue
+            # OSV's evaluation sorts events by version before pairing them;
+            # "0" (introduced at the very beginning) sorts first.
+            evs = [ev for ev in (rng.get("events") or [])
+                   if isinstance(ev, dict) and ev]
+            evs.sort(key=lambda ev: (0,) if str(next(iter(ev.values()))) == "0"
+                     else (1, vk(next(iter(ev.values())))))
+            intro = None
+            spans = []
+            for ev in evs:
+                if "introduced" in ev:
+                    intro = str(ev["introduced"])
+                elif "fixed" in ev:
+                    spans.append((intro, str(ev["fixed"]), False))
+                    intro = None
+                elif "last_affected" in ev:
+                    spans.append((intro, str(ev["last_affected"]), True))
+                    intro = None
+            if intro is not None:
+                spans.append((intro, None, False))
+            for lo, end, inclusive in spans:
+                if end and not inclusive and is_commit_hash(end):
+                    continue
+                lo_ok = lo in (None, "0") or vk(lo) <= ik
+                if end is None:
+                    hit = lo_ok
+                elif inclusive:
+                    hit = lo_ok and ik <= vk(end)
+                else:
+                    hit = lo_ok and ik < vk(end)
+                    if vk(end) > ik:
+                        later.append(end)
+                if hit and end and not inclusive:
+                    in_range.append(end)
+                elif hit:
+                    unfixed = True
+    if in_range:
+        return min(in_range, key=vk)
+    if unfixed:
+        # Inside a range with no published fix on its branch: a fix from
+        # another branch is not this version's fix.
+        return None
+    # The installed version sits in no listed range (OSV matched it some other
+    # way, e.g. an explicit `versions` list): nearest fix above it.
+    return min(later, key=vk) if later else None
 
 
 OSV_ECOSYSTEM = {"pypi": "pypi", "npm": "npm", "maven": "maven", "golang": "go",
@@ -1113,62 +1480,15 @@ def osv_name(p: dict) -> str:
 
 
 def fix_for(d: dict, comp: dict) -> Any:
-    """Smallest version that fixes advisory `d` for THIS component's version.
-
-    Only the `affected` entry for the component's own package counts, and
-    only the range containing the installed version. An advisory covering
-    Tomcat 9, 10 and 11 lists a fix per branch; taking the largest string
-    across all of them told an 11.0.22 user to "upgrade to >= 9.0.121".
-    GIT ranges (whose "fixed" is a commit SHA) are skipped.
-    Returns None when no published fix applies.
-    """
+    """Smallest version that fixes advisory `d` for THIS component's version
+    (see fix_from_affected), or None."""
     p = parse_purl(comp.get("purl"))
     inst = p.get("version")
     if not inst:
         return None
-    ik = version_key(inst)
     eco = OSV_ECOSYSTEM.get(str(p.get("type") or "").lower())
     want = osv_name(p)
-    in_range: list = []
-    later: list = []
-    for aff in (d.get("affected") or []):
-        pkg = aff.get("package") or {}
-        if eco and str(pkg.get("ecosystem", "")).lower().split(":")[0] != eco:
-            continue
-        pname = str(pkg.get("name") or "")
-        pname = norm_pyname(pname) if eco == "pypi" else pname.lower()
-        if pname != want:
-            continue
-        for rng in (aff.get("ranges") or []):
-            if str(rng.get("type", "")).upper() == "GIT":
-                continue
-            intro = None
-            spans = []
-            for ev in (rng.get("events") or []):
-                if "introduced" in ev:
-                    intro = str(ev["introduced"])
-                elif "fixed" in ev:
-                    spans.append((intro, str(ev["fixed"])))
-                    intro = None
-                elif "last_affected" in ev:
-                    spans.append((intro, None))
-                    intro = None
-            if intro is not None:
-                spans.append((intro, None))
-            for lo, fixed in spans:
-                if fixed and re.fullmatch(r"[0-9a-f]{7,40}", fixed):
-                    continue
-                if fixed and version_key(fixed) > ik:
-                    later.append(fixed)
-                lo_ok = lo in (None, "0") or version_key(lo) <= ik
-                if lo_ok and (fixed is None or ik < version_key(fixed)):
-                    if fixed:
-                        in_range.append(fixed)
-    if in_range:
-        return min(in_range, key=version_key)
-    # The installed version sits in no listed range (OSV matched it some other
-    # way, e.g. an explicit `versions` list): nearest fix above it.
-    return min(later, key=version_key) if later else None
+    return fix_from_affected(d.get("affected") or [], eco, want, inst)
 
 
 def group_aliases(ids: list, details: dict) -> list:
@@ -1245,13 +1565,13 @@ def headline_severity(v: dict) -> str:
 
 def component_fixes(comp: dict, hits: list) -> list:
     """One fix version per advisory that has one, for this component."""
-    keys = set(comp_keys(comp))
+    keys = set(vuln_keys(comp))
     out = []
     for h in hits:
         byref = h.get("_fixByRef") or {}
         f = next((byref[k] for k in byref if k in keys), None)
         if f is None and h.get("_fixVersions"):
-            f = max(h["_fixVersions"], key=version_key)
+            f = max(h["_fixVersions"], key=comp_vkey(comp))
         if f:
             out.append(f)
     return out
@@ -1259,7 +1579,7 @@ def component_fixes(comp: dict, hits: list) -> list:
 
 def patch_status_for(comp: dict, vuln_index: dict, scanned: bool = True) -> str:
     hits = []
-    for k in comp_keys(comp):
+    for k in vuln_keys(comp):
         hits.extend(vuln_index.get(k, []))
     if not hits:
         if not scanned:
@@ -1278,10 +1598,10 @@ def patch_status_for(comp: dict, vuln_index: dict, scanned: bool = True) -> str:
     label = SEV_LABEL.get(worst, "unknown")
     n = len(hits)
     if fixes and len(fixes) == n:
-        return ("patch available (upgrade to >= " + max(fixes, key=version_key)
+        return ("patch available (upgrade to >= " + max(fixes, key=comp_vkey(comp))
                 + "); " + str(n) + " known issue(s), max severity " + label)
     if fixes:
-        return ("partial patch (upgrade to >= " + max(fixes, key=version_key)
+        return ("partial patch (upgrade to >= " + max(fixes, key=comp_vkey(comp))
                 + " fixes " + str(len(fixes)) + " of " + str(n)
                 + "); max severity " + label)
     return ("patch pending; no fixed version published; " + str(n)
@@ -1402,7 +1722,22 @@ def main() -> int:
     md = bom.setdefault("metadata", {})
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     md.setdefault("properties", [])
+    # Findings already in the input are dropped. Whether they came from an
+    # earlier run of this script or were carried through merge_boms.py from
+    # a generator, they describe an earlier moment, and without their scan
+    # provenance they would sit in field 8 while patch status said "not
+    # assessed". This run's findings come only from --vulns / --scan-osv;
+    # to keep a file's findings, pass it as --vulns.
+    if bom.get("vulnerabilities"):
+        log("NOTE dropped " + str(len(bom["vulnerabilities"])) + " finding(s) "
+            "already in the input; pass a findings file with --vulns to keep them")
+    bom["vulnerabilities"] = []
+    md["properties"] = [p for p in md["properties"] if p.get("name") not in (
+        "certin:vulnScanSource", "certin:vulnScanTime",
+        "certin:unscannableComponents")]
     if bom.get("serialNumber"):
+        md["properties"] = [p for p in md["properties"]
+                            if p.get("name") != "certin:derivedFromSerial"]
         md["properties"].append({"name": "certin:derivedFromSerial",
                                  "value": str(bom["serialNumber"])})
     bom["serialNumber"] = "urn:uuid:" + str(uuid.uuid4())
@@ -1410,9 +1745,13 @@ def main() -> int:
     md["timestamp"] = now
     tools = md.setdefault("tools", {"components": []})
     if isinstance(tools, dict):
-        tools.setdefault("components", []).append(
-            {"type": "application", "name": "certin_enrich.py",
-             "version": TOOL_VERSION})
+        # Replace, never duplicate: the schema requires unique tool entries,
+        # and re-enriching an enriched SBOM must stay valid.
+        tc = [t for t in (tools.get("components") or [])
+              if not (isinstance(t, dict) and t.get("name") == "certin_enrich.py")]
+        tc.append({"type": "application", "name": "certin_enrich.py",
+                   "version": TOOL_VERSION})
+        tools["components"] = tc
     if not md.get("authors"):
         author = (project.get("sbomAuthor")
                   or os.environ.get("GITHUB_REPOSITORY")
@@ -1444,10 +1783,12 @@ def main() -> int:
             direct.update(d.get("dependsOn") or [])
 
     components = bom.get("components") or []
+    if cdx_vulns:
+        cdx_vulns, vuln_index = attach_to_components(cdx_vulns, components, root)
     if not direct:
         # no usable graph -> treat all as direct so criticality stays meaningful
         for c in components:
-            direct.update(comp_keys(c))
+            direct.update(vuln_keys(c))
 
     # Declared direct dependencies (requirements.in / pyproject.toml) override
     # whatever the graph implied. Also written back into the root's dependsOn
@@ -1458,9 +1799,13 @@ def main() -> int:
                          if root_ref and d.get("ref") == root_ref), None)
         promoted = 0
         for c in components:
+            # Declared names are Python package names: an npm or Maven
+            # component that happens to share one is not being declared.
+            if str(parse_purl(c.get("purl")).get("type") or "").lower() != "pypi":
+                continue
             if norm_pyname(c.get("name")) not in declared:
                 continue
-            keys = comp_keys(c)
+            keys = vuln_keys(c)
             if not any(k in direct for k in keys):
                 direct.update(keys)
                 promoted += 1
@@ -1476,9 +1821,16 @@ def main() -> int:
         if args.offline:
             log("WARNING --scan-osv ignored because --offline was given")
         else:
-            osv_index, osv_vulns, unscannable = scan_osv(components)
+            try:
+                osv_index, osv_vulns, unscannable = scan_osv(components)
+            except ScanIncomplete as e:
+                log("ERROR vulnerability scan incomplete: " + str(e))
+                log("No SBOM written: an incomplete scan would report "
+                    "unchecked components as having no known vulnerabilities.")
+                return 3
             for k, v in osv_index.items():
                 vuln_index.setdefault(k, []).extend(v)
+            suppress_by_vex(vuln_index, cdx_vulns, components, root)
             cdx_vulns.extend(osv_vulns)
             scan_ran = True
             scan_source = ((scan_source + " + OSV.dev") if scan_source
@@ -1491,13 +1843,9 @@ def main() -> int:
     # Record WHAT scanned. Field 8 only counts as assessed with this present,
     # so an empty vulnerability list can never masquerade as "clean".
     if scan_source:
-        md.setdefault("properties", [])
-        if not any(p.get("name") == "certin:vulnScanSource"
-                   for p in md["properties"]):
-            md["properties"].append({"name": "certin:vulnScanSource",
-                                     "value": scan_source})
-            md["properties"].append({"name": "certin:vulnScanTime",
-                                     "value": now})
+        md["properties"].append({"name": "certin:vulnScanSource",
+                                 "value": scan_source})
+        md["properties"].append({"name": "certin:vulnScanTime", "value": now})
         if unscannable:
             md["properties"].append(
                 {"name": "certin:unscannableComponents",
@@ -1571,30 +1919,38 @@ def main() -> int:
         # Never guessed: an unrecognised licence produces a loud marker so a
         # human routes it to Legal.
         if entry.get("usageRestrictions"):
-            set_prop(comp, "usageRestrictions", entry["usageRestrictions"])
+            set_prop(comp, "usageRestrictions", entry["usageRestrictions"], overwrite=True)
         elif lic_table:
             rtext, rcat, rrisk, runknown = resolve_restrictions(comp, lic_table)
-            set_prop(comp, "usageRestrictions", rtext)
-            set_prop(comp, "licenseCategory", rcat)
-            set_prop(comp, "distributionRisk", rrisk)
+            set_prop(comp, "usageRestrictions", rtext, overwrite=True)
+            set_prop(comp, "licenseCategory", rcat, overwrite=True)
+            set_prop(comp, "distributionRisk", rrisk, overwrite=True)
             if runknown:
                 unrecognised_licences.setdefault(
                     ", ".join(runknown), []).append(
                         str(comp.get("name")) + "@" + str(comp.get("version")))
         else:
             set_prop(comp, "usageRestrictions",
-                     defaults.get("usageRestrictions", "none"))
+                     defaults.get("usageRestrictions", "none"), overwrite=True)
         set_prop(comp, "comments", entry.get("comments"))
         set_prop(comp, "origin",
-                 entry.get("origin") or derive_origin(comp, org_names))
+                 entry.get("origin") or derive_origin(comp, org_names), overwrite=True)
 
         # dates
         set_prop(comp, "releaseDate",
                  entry.get("releaseDate") or online.get("releaseDate"))
-        set_prop(comp, "eolDate",
-                 entry.get("eolDate")
-                 or lookup_eol(comp, eol_cache, args.offline)
-                 or defaults.get("eolDate", "not published by supplier"))
+        # EOL: curated -> endoflife.date -> default. Refreshed on every online
+        # run. An offline run did not look, so it says so instead of claiming
+        # the supplier publishes nothing, and it keeps a value found earlier.
+        if entry.get("eolDate"):
+            set_prop(comp, "eolDate", entry["eolDate"], overwrite=True)
+        elif args.offline:
+            set_prop(comp, "eolDate", "not looked up (offline run)")
+        else:
+            set_prop(comp, "eolDate",
+                     lookup_eol(comp, eol_cache, args.offline)
+                     or defaults.get("eolDate", "not published by supplier"),
+                     overwrite=True)
 
         # vulnerabilities -> patch status (always recomputed; it is time-sensitive)
         set_prop(comp, "patchStatus",
@@ -1605,20 +1961,22 @@ def main() -> int:
         # criticality. sbom-metadata.yml calls this human judgement; where no
         # human has ruled, the derived value says so rather than passing as one.
         if entry.get("criticality"):
-            set_prop(comp, "criticality", entry["criticality"])
-            set_prop(comp, "criticalitySource", "curated metadata")
+            set_prop(comp, "criticality", entry["criticality"], overwrite=True)
+            set_prop(comp, "criticalitySource", "curated metadata", overwrite=True)
         else:
             set_prop(comp, "criticality",
-                     derive_criticality(comp, direct, vuln_index))
+                     derive_criticality(comp, direct, vuln_index), overwrite=True)
             set_prop(comp, "criticalitySource",
                      "derived: vulnerable+direct=critical, vulnerable=high, "
-                     "direct=medium, else low; not yet reviewed")
+                     "direct=medium, else low; not yet reviewed", overwrite=True)
 
-        # file-nature properties
+        # file-nature properties. Derived values above are recomputed on every
+        # run (overwrite=True): re-enriching must not keep a criticality or
+        # licence risk that the new data no longer supports.
         ex, ar, st = derive_file_props(comp)
-        set_prop(comp, "executable", entry.get("executable", ex))
-        set_prop(comp, "archive", entry.get("archive", ar))
-        set_prop(comp, "structured", entry.get("structured", st))
+        set_prop(comp, "executable", entry.get("executable", ex), overwrite=True)
+        set_prop(comp, "archive", entry.get("archive", ar), overwrite=True)
+        set_prop(comp, "structured", entry.get("structured", st), overwrite=True)
 
         set_prop(comp, "enrichedBy", "certin_enrich.py")
 
@@ -1628,13 +1986,15 @@ def main() -> int:
             "Maven multi-licence lists rewritten)")
 
     # ---- attach vulnerabilities (VDR) ------------------------------------
-    if cdx_vulns:
-        bom["vulnerabilities"] = [
-            {k: v for k, v in vd.items() if not k.startswith("_")}
-            for vd in cdx_vulns
-        ]
-    else:
-        bom.setdefault("vulnerabilities", [])
+    # Sorted, so an identical scan yields an identical document: OSV's
+    # response order varies, and the inventory publish step compares content.
+    out_vulns = []
+    for vd in sorted(cdx_vulns, key=lambda x: str(x.get("id"))):
+        rec = {k: v for k, v in vd.items() if not k.startswith("_")}
+        if rec.get("affects"):
+            rec["affects"] = sorted(rec["affects"], key=lambda a: str(a.get("ref")))
+        out_vulns.append(rec)
+    bom["vulnerabilities"] = out_vulns
 
     # ---- validate --------------------------------------------------------
     coverage = dict((f, 0) for f in CERTIN_FIELDS)
@@ -1674,7 +2034,10 @@ def main() -> int:
             "measure the enriched output `" + os.path.basename(args.output) + "`",
             "- Components analysed: **" + str(total) + "**",
             "- Vulnerabilities recorded: **" + str(nvulns) + "** ("
-            + str(len({c for v in cdx_vulns for c in (v.get("_cves") or [])}))
+            + str(len({c for v in cdx_vulns
+                       for c in (v.get("_cves")
+                                 or [x for x in [str(v.get("id") or "")]
+                                     if x.startswith("CVE-")])}))
             + " distinct CVE ids; advisories describing the same CVE are merged)",
             "- Overall field coverage: **" + ("%.1f" % overall) + "%**",
             "- SBOM timestamp: `" + str(md.get("timestamp")) + "`",
@@ -1713,24 +2076,39 @@ def main() -> int:
         # names one makes the reader open a 500KB JSON to learn anything.
         # cdx_vulns still carries the internal _fixVersions/_cves keys;
         # bom["vulnerabilities"] has had them stripped for output.
-        vulns = cdx_vulns or (bom.get("vulnerabilities") or [])
+        # Only findings counted against a component (see the vulnerability
+        # index): a VEX "not_affected" entry stays in the SBOM but is not an
+        # exposure, so it is not listed or counted here.
+        def counted(v: dict, ref: Any) -> bool:
+            return any(x is v for x in vuln_index.get(ref, []))
+        vulns = [v for v in cdx_vulns
+                 if any(counted(v, a.get("ref")) for a in (v.get("affects") or []))]
         if vulns:
             sev_rank = {"critical": 4, "high": 3, "medium": 2,
                         "moderate": 2, "low": 1}
             # group by affected component
             label_for = {}
             for c in components:
-                lbl = ((str(c.get("group")) + "/") if c.get("group") else "")                     + str(c.get("name")) + "@" + str(c.get("version"))
+                lbl = (((str(c.get("group")) + "/") if c.get("group") else "")
+                       + str(c.get("name")) + "@" + str(c.get("version")))
+                # Classifier variants (netty linux/osx) are separate files and
+                # get separate rows, not one row counting both sets.
+                cls = [q for q in str(c.get("purl") or "").partition("?")[2].split("&")
+                       if q.startswith("classifier=")]
+                if cls:
+                    lbl += " [" + cls[0].split("=", 1)[1] + "]"
                 for k in (c.get("bom-ref"), c.get("purl")):
                     if k:
                         label_for[k] = lbl
             grouped: dict = {}
             comp_for: dict = {}
             for c in components:
-                for k in comp_keys(c):
+                for k in vuln_keys(c):
                     comp_for.setdefault(k, c)
             for v in vulns:
                 for aff in (v.get("affects") or []):
+                    if not counted(v, aff.get("ref")):
+                        continue
                     key = label_for.get(aff.get("ref"), str(aff.get("ref")))
                     grouped.setdefault(key, []).append(v)
                     comp_for.setdefault(key, comp_for.get(aff.get("ref"), {}))
@@ -1747,11 +2125,21 @@ def main() -> int:
             tally = ", ".join(str(counts[k]) + " " + k for k in
                               sorted(counts, key=lambda k: -sev_rank.get(k, 0)))
 
+            # The product root is not one of the `total` components.
+            root_label = str(root_ref) if root_ref else None
+            n_comp = len([k for k in grouped if k != root_label])
+            on_root = root_label in grouped
+            not_counted = nvulns - len(vulns)
             lines += ["", "## Vulnerability findings", "",
                       "**" + str(len(vulns)) + " advisor"
                       + ("y" if len(vulns) == 1 else "ies")
-                      + " affecting " + str(len(grouped))
-                      + " of " + str(total) + " components** — " + tally + ".",
+                      + " affecting " + str(n_comp)
+                      + " of " + str(total) + " components"
+                      + (" and the product itself" if on_root else "")
+                      + "** — " + tally + "."
+                      + ((" A further " + str(not_counted) + " recorded finding(s) "
+                          "are marked not applicable (VEX) and not counted.")
+                         if not_counted > 0 else ""),
                       "",
                       "Scanned against " + str(scan_source or "no source")
                       + " at " + now + ". An advisory match means a "
@@ -1766,11 +2154,12 @@ def main() -> int:
                 vs = grouped[comp_label]
                 sev = {4: "critical", 3: "high", 2: "medium",
                        1: "low"}.get(worst_of(vs), "unrated")
-                fixes = component_fixes(comp_for.get(comp_label) or {}, vs)
+                ccomp = comp_for.get(comp_label) or {}
+                fixes = component_fixes(ccomp, vs)
                 if not fixes:
                     fix = "none published"
                 else:
-                    fix = "upgrade to >= " + max(fixes, key=version_key)
+                    fix = "upgrade to >= " + max(fixes, key=comp_vkey(ccomp))
                     if len(fixes) < len(vs):
                         fix += " (fixes " + str(len(fixes)) + " of " + str(len(vs)) + ")"
                 ids = []

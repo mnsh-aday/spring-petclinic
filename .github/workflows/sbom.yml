@@ -187,8 +187,10 @@ jobs:
             "$MVN" -B -f "$d/pom.xml" $SFLAG \
               org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
               -DoutputFormat=json -DoutputName=bom -DschemaVersion=1.6
-            found=$(find "$d" -path '*/target/bom.json' | head -1)
-            [ -n "$found" ] || { echo "::error::maven produced no bom.json in $d"; exit 1; }
+            # makeAggregateBom writes the aggregate to the project's own
+            # target/. Searching the tree could pick up a module's BOM.
+            found="$d/target/bom.json"
+            [ -f "$found" ] || { echo "::error::maven produced no $found"; exit 1; }
             cp "$found" "boms/maven-$safe.json"
             echo "wrote boms/maven-$safe.json"
             echo "::endgroup::"
@@ -449,35 +451,36 @@ jobs:
       #                         scoped to ONLY that inventory repo
       # Set them as organisation secrets so every repo inherits them.
       # -------------------------------------------------------------------
-      # The secrets context cannot be used in a step `if:`, so this step
-      # turns "are they set" into an output without exposing the values.
-      - name: Check inventory configuration
-        id: inv
-        env:
-          INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
-          INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
-        run: |
-          if [ -n "$INVENTORY_REPO" ] && [ -n "$INVENTORY_TOKEN" ]; then
-            echo "configured=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=0" >> "$GITHUB_OUTPUT"
-          fi
-
+      # The token is given to this step only, sent as an HTTP header through
+      # git's environment-based config (not the command line, which any
+      # process can list), and never written to disk: a token in the clone
+      # URL is stored in _inventory/.git/config, where every later step
+      # (including third-party post-job hooks) could read it.
       - name: Publish SBOM to the inventory
-        if: steps.inv.outputs.configured == '1' && success()
+        if: success()
         env:
           INVENTORY_REPO: ${{ secrets.SBOM_INVENTORY_REPO }}
           INVENTORY_TOKEN: ${{ secrets.SBOM_INVENTORY_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${INVENTORY_REPO:-}" ] || [ -z "${INVENTORY_TOKEN:-}" ]; then
+            echo "> SBOM not published to a central inventory - \`SBOM_INVENTORY_REPO\` / \`SBOM_INVENTORY_TOKEN\` are not set. The nightly sweep will not see this project." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          B64=$(printf 'x-access-token:%s' "$INVENTORY_TOKEN" | base64 -w0)
+          echo "::add-mask::$B64"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $B64"
+          trap 'rm -rf "$GITHUB_WORKSPACE/_inventory"' EXIT
           SLUG=$(echo "${{ github.repository }}" | tr '/' '_')
           git clone --quiet --depth 1 \
-            "https://x-access-token:${INVENTORY_TOKEN}@github.com/${INVENTORY_REPO}.git" \
-            _inventory
+            "https://github.com/${INVENTORY_REPO}.git" _inventory
           mkdir -p "_inventory/sboms"
           DEST="_inventory/sboms/${SLUG}.cdx.json"
           # Compare CONTENT, ignoring what changes on every run (serial,
-          # timestamps, commit). Byte comparison republished on every run.
+          # timestamps, commit - including a root version that IS the commit,
+          # as it is for repos without a Maven root). Byte comparison
+          # republished on every run.
           if [ -f "$DEST" ] && python - "$DEST" bom.certin.json <<'PY'
           import json, sys
           VOLATILE = {"certin:vulnScanTime", "certin:derivedFromSerial", "certin:vcsRevision"}
@@ -486,8 +489,13 @@ jobs:
               b.pop("serialNumber", None)
               md = b.get("metadata") or {}
               md.pop("timestamp", None)
-              md["properties"] = [x for x in md.get("properties") or []
-                                  if x.get("name") not in VOLATILE]
+              props = md.get("properties") or []
+              rev = next((x.get("value") for x in props
+                          if x.get("name") == "certin:vcsRevision"), None)
+              root = md.get("component") or {}
+              if rev and root.get("version") == rev:
+                  root.pop("version")
+              md["properties"] = [x for x in props if x.get("name") not in VOLATILE]
               return b
           sys.exit(0 if norm(sys.argv[1]) == norm(sys.argv[2]) else 1)
           PY
@@ -509,15 +517,10 @@ jobs:
           git commit -m "SBOM: ${{ github.repository }} @ ${{ github.sha }}"
           # Another repo may publish at the same moment; rebase and retry.
           for i in 1 2 3; do
-            if git push; then echo "published"; exit 0; fi
+            if git push --quiet; then echo "published"; exit 0; fi
             echo "push rejected (attempt $i) - rebasing"
             git pull --rebase --quiet || true
             sleep $((i * 3))
           done
           echo "::error::could not publish SBOM to ${INVENTORY_REPO} after 3 attempts"
           exit 1
-
-      - name: Note when publishing is not configured
-        if: steps.inv.outputs.configured == '0'
-        run: |
-          echo "> SBOM not published to a central inventory - \`SBOM_INVENTORY_REPO\` is not set. The nightly sweep will not see this project." >> "$GITHUB_STEP_SUMMARY"

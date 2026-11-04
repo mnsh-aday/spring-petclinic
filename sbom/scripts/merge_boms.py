@@ -59,7 +59,8 @@ def tool_entry(e: dict) -> dict:
     have, and may lack the required `type`.
     """
     out = {k: v for k, v in e.items()
-           if k in ("type", "group", "name", "version", "publisher", "author")}
+           if k in ("type", "group", "name", "version", "publisher", "author",
+                    "description", "hashes", "licenses", "externalReferences")}
     if e.get("vendor") and "publisher" not in out:
         out["publisher"] = e["vendor"]
     out.setdefault("type", "application")
@@ -169,6 +170,10 @@ def main() -> int:
             if not isinstance(e, dict):
                 continue
             key = (e.get("name"), e.get("version"))
+            # This run's own entry is added below; an input that was itself
+            # merged carries one already, and a duplicate breaks the schema.
+            if e.get("name") == "merge_boms.py":
+                continue
             if e.get("name") and key not in seen_tools:
                 seen_tools.add(key)
                 tools.append(tool_entry(e))
@@ -191,13 +196,15 @@ def main() -> int:
                   + args.primary, file=sys.stderr)
             return 2
         pc = (prim.get("metadata") or {}).get("component") or {}
-        for k in ("group", "name", "version", "purl", "licenses",
+        # `name` stays the repository's: the inventory and the nightly sweep
+        # key each project on it, and artifactIds are not unique across repos.
+        for k in ("group", "version", "purl", "licenses",
                   "supplier", "publisher", "hashes"):
             if pc.get(k):
                 root[k] = pc[k]
-    props: list = []
+    md_props: list = []
     if args.revision:
-        props.append({"name": "certin:vcsRevision", "value": args.revision})
+        md_props.append({"name": "certin:vcsRevision", "value": args.revision})
     if args.vcs_url:
         root["externalReferences"] = [{"type": "vcs", "url": args.vcs_url}]
     # Which dependency scopes each generator included. Dropping this left the
@@ -205,9 +212,9 @@ def main() -> int:
     for p, b in boms:
         for pr in ((b.get("metadata") or {}).get("properties") or []):
             if pr.get("name") == "maven.scopes":
-                props.append({"name": "certin:includedScopes:"
-                              + p.replace("\\", "/").split("/")[-1],
-                              "value": pr.get("value")})
+                md_props.append({"name": "certin:includedScopes:"
+                                 + p.replace("\\", "/").split("/")[-1],
+                                 "value": pr.get("value")})
     merged: dict = {
         "bomFormat": "CycloneDX",
         "specVersion": spec,
@@ -225,7 +232,7 @@ def main() -> int:
             # Licence of the SBOM DOCUMENT itself, not of its contents.
             # CC0 is the convention, matching SPDX's dataLicense.
             "licenses": [{"license": {"id": "CC0-1.0"}}],
-            **({"properties": props} if props else {}),
+            **({"properties": md_props} if md_props else {}),
         },
         "components": [],
         "dependencies": [],
@@ -297,19 +304,22 @@ def main() -> int:
     for e in NESTED_EDGES:
         reached.update(e.get("dependsOn") or [])
 
-    if alias:
-        by_ref: dict = {}
-        for d in dep_entries:
-            r = alias.get(d.get("ref"), d.get("ref"))
-            tgt = [alias.get(t, t) for t in (d.get("dependsOn") or [])]
-            if r in by_ref:
-                by_ref[r]["dependsOn"].extend(tgt)
-            else:
-                by_ref[r] = {"ref": r, "dependsOn": tgt}
-        dep_entries = [{"ref": e["ref"], "dependsOn": list(dict.fromkeys(e["dependsOn"]))}
-                       for e in by_ref.values()]
-        root_children = [alias.get(t, t) for t in root_children]
-        reached = {alias.get(t, t) for t in reached}
+    # One graph entry per ref. The same component in two inputs (under one
+    # bom-ref, or under two that de-duplication aliased together) arrives
+    # with two entries; CycloneDX expects one, holding the union of edges.
+    by_ref: dict = {}
+    for d in dep_entries:
+        r = alias.get(d.get("ref"), d.get("ref"))
+        tgt = [alias.get(t, t) for t in (d.get("dependsOn") or [])]
+        if r in by_ref:
+            by_ref[r]["dependsOn"].extend(tgt)
+        else:
+            by_ref[r] = {"ref": r, "dependsOn": tgt}
+    dep_entries = [{"ref": e["ref"],
+                    "dependsOn": [t for t in dict.fromkeys(e["dependsOn"]) if t != e["ref"]]}
+                   for e in by_ref.values()]
+    root_children = [alias.get(t, t) for t in root_children]
+    reached = {alias.get(t, t) for t in reached}
 
     # Orphans: components no edge points at. Happens when a generator emits no
     # graph at all (then ALL its components are orphans, which correctly makes

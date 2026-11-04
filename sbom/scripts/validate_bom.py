@@ -38,10 +38,20 @@ def check(path: str) -> int:
         print("[validate] " + path + ": " + str(d.message)[:200]
               + " at /" + "/".join(str(p) for p in d.absolute_path))
 
-    refs = {c.get("bom-ref") for c in (bom.get("components") or []) if c.get("bom-ref")}
-    root = ((bom.get("metadata") or {}).get("component") or {}).get("bom-ref")
-    if root:
-        refs.add(root)
+    # Nested components (cyclonedx-npm emits them) are components too.
+    refs: set = set()
+    stack = list(bom.get("components") or [])
+    root_comp = (bom.get("metadata") or {}).get("component") or {}
+    stack.append(root_comp)
+    while stack:
+        c = stack.pop()
+        if isinstance(c, dict):
+            if c.get("bom-ref"):
+                refs.add(c["bom-ref"])
+            stack.extend(c.get("components") or [])
+    for s in (bom.get("services") or []):
+        if isinstance(s, dict) and s.get("bom-ref"):
+            refs.add(s["bom-ref"])
     bad = []
     for d in (bom.get("dependencies") or []):
         for r in [d.get("ref")] + list(d.get("dependsOn") or []):
